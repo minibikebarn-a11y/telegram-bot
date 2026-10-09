@@ -1,0 +1,117 @@
+HOW TO ADD PRODUCT IMAGES TO THE BOT
+=====================================
+
+1. Create a folder called "images" inside the bot folder (same folder as "conf").
+   Path: little bit\images\
+
+2. Save each product image as a .jpg file using EXACTLY the filename listed below.
+   The filenames must be lowercase with underscores — no spaces, no emojis.
+
+3. The bot will automatically pick up each image the first time that product is viewed.
+   No restart needed after adding images to the folder.
+
+----------------------------------------------------------------------
+PRODUCT IMAGE FILENAMES
+----------------------------------------------------------------------
+
+BENZOS / Pills
+  hjhfjj.jpg
+  diazepam_valium_10mg_martin_dows.jpg
+
+SLEEP / ANXIETY / Pills
+  zopiclone_hab_7_5mg.jpg
+
+CANNABIS / Sweet Edibles
+  500mg_relax_edibles_cherry.jpg
+  500mg_relax_edibles_cola_bottles.jpg
+  500mg_relax_edibles_pina_colada.jpg
+  500mg_relax_edibles_pineapple.jpg
+  500mg_relax_edibles_apple.jpg
+  500mg_relax_edibles_strawberry.jpg
+  500mg_relax_edibles_orange_lemon.jpg
+  500mg_relax_edibles_mixed_berries.jpg
+  500mg_relax_edibles_watermelon.jpg
+  500mg_relax_edibles_blue_raspberry.jpg
+
+CANNABIS / Extracts
+  rick_simpson_oil_rso.jpg
+
+CANNABIS / Hash
+  lemon_sherbet_squidgy_black_hash.jpg
+  durban_poison_squidgy_black_hash.jpg
+  fruity_pebbles_squidgy_black_hash.jpg
+  zushi_squidgy_black_hash.jpg
+  ghost_train_haze_blonde_hash.jpg
+  watermelon_skittles_blonde_hash.jpg
+  toad_venom_piatella_hash.jpg
+  candy_rain_piatella_hash.jpg
+
+CANNABIS / Vapes
+  1ml_wizard_trees_sleeve_cali_vapes_10_strains.jpg
+
+DISSOCIATIVES / Ketamine
+  red_label_long_shard_needles_s_isomer.jpg
+  astral_ketamine_sand.jpg
+  diamond_rock_ketamine_new_synth.jpg
+  buddha_ketamine_needles_s_isomer.jpg
+
+DISSOCIATIVES / Quattro Forketti Bundle
+  4x3_5g_bundle_30_off.jpg
+  4x1g_bundle_40_off.jpg
+
+DISSOCIATIVES / GBL
+  99_9_gbl_liquid_xtc_up_to_25l.jpg
+
+ECSTASY / MDMA
+  euphoric_dutch_champagne_mdma_91.jpg
+
+ECSTASY / Pills
+  purple_punisher_300mg_xtc.jpg
+  tesla_300mg_xtc.jpg
+
+OPIATES / Codeine
+  codeine_phosphate_teva_30mg.jpg
+
+STIMULANTS / Methamphetamine
+  clandestine_dutch_ephedrine_meth.jpg
+  hong_kong_premium_triads_meth_d_isomer.jpg
+  iranian_superlab_meth_batch_2_d_isomer.jpg
+
+STIMULANTS / Cocaine
+  bolivian_cream_cocaine_p500_1.jpg
+  colombian_power_coke_lacoste_1.jpg
+
+PSYCHEDELIC / LSD
+  dr_seuss_ds3_xtal_200ug_lsd.jpg
+  100ug_dr_suess_acid_lsd.jpg
+
+PSYCHEDELIC / 2C-B
+  2c_b_drops_125mg_candy_flavour.jpg
+  22mg_2c_b_bumble_bees.jpg
+  pure_2c_b_powder_hcl.jpg
+
+PSYCHEDELIC / Mushrooms
+  shroom_drops_vanilla_flavour.jpg
+  machine_elf_whole_mushrooms.jpg
+  tidal_wave_4_whole_mushrooms.jpg
+  albino_hillbilly_pumpkin_whole_mushrooms.jpg
+  albino_penis_envy_whole_mushrooms.jpg
+
+QUAALUDES / Pills
+  quaaludes_lemmon_714.jpg
+
+----------------------------------------------------------------------
+NOTES
+----------------------------------------------------------------------
+
+- Images that are missing are skipped — the product still shows with the
+  default menu image. You can add images one at a time at any point.
+
+- Recommended size: 800x800 px or larger, square crop works best in Telegram.
+
+- Once the bot sends an image to Telegram it caches the file ID in memory,
+  so subsequent views of the same product are instant. The cache resets
+  on bot restart, but the image is re-uploaded automatically.
+
+- If a product image looks wrong, delete the file and save the correct one
+  with the same filename, then restart the bot to clear the cache.

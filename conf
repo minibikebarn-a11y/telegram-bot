@@ -1,0 +1,2578 @@
+from config import API_TOKEN
+# ========== IMPORT PRODUCTION-SAFE DATABASE MODULE ==========
+from database import (
+    init_db,
+    db_register_user,
+    db_user_exists,
+    db_get_user,
+    db_get_user_emoji,
+    db_get_pending_orders,
+    db_get_all_user_ids,
+    db_user_count,
+    db_add_review,
+    db_get_reviews,
+    db_health_check,
+    get_db_connection,
+    _get_cursor,
+    db_get_wishlist,
+    db_add_wishlist_item,
+    db_remove_wishlist_item,
+)
+try:
+    from reviews_data import REVIEWS_DATA
+except ImportError:
+    # Fallback default reviews if reviews_data.py not found
+    REVIEWS_DATA = [
+        (5, 55.00, "❄️ *LIMITED DEAL* 3.5g for £50 (Cheap Sociable)", "NDD, great stealth and a good buzz for the price👌", "today at 07:28"),
+        (5, 400.00, "🚀 14g for £350 (HQ), ❄️ *LIMITED DEAL* 3.5g for £50 (Cheap Sociable)", "10/10 as always 🫡", "18 Jun, 2026 at 22:55"),
+        (5, 95.00, "🏆 *LIMITED DEAL* 3.5g for £70 (Premium Sociable), ❄️ *LIMITED DEAL* 1g for £20 (Cheap Sociable)", "Great service again from Popeye and ndd great value for money, thanks again 👍", "18 Jun, 2026 at 18:33"),
+        (5, 75.00, "🏆 *LIMITED DEAL* 3.5g for £70 (Premium Sociable)", "Once again mrPopeye you amaze me thanks 🤩", "18 Jun, 2026 at 15:37"),
+        (5, 185.00, "🚀 7g for £185 (HQ)", "2dd, great product great price", "18 Jun, 2026 at 13:15"),
+    ]
+import telebot
+from telebot import types
+import logging
+import threading
+import random
+import time
+import qrcode
+import io
+import requests
+import string
+import os
+import json
+import urllib.parse
+from datetime import datetime
+from contextlib import contextmanager  # For db_conn() decorator
+from flask import Flask, send_from_directory
+
+logging.basicConfig(level=logging.INFO)
+
+# ---------------------------------------------------------------------------
+# Mini App web server — serves webapp/product.html over HTTPS on Railway.
+# Set WEBAPP_URL env var to your Railway domain, e.g.:
+#   https://popeyeye-production.up.railway.app
+# Without it the bot falls back to standard inline Add-to-Cart buttons.
+# ---------------------------------------------------------------------------
+WEBAPP_BASE_URL = os.environ.get('WEBAPP_URL', '').rstrip('/')
+
+_flask_app = Flask(__name__)
+
+@_flask_app.route('/webapp/<path:filename>')
+def _serve_webapp(filename):
+    return send_from_directory(
+        os.path.join(os.path.dirname(__file__), 'webapp'), filename
+    )
+
+def _start_flask():
+    port = int(os.environ.get('PORT', 8080))
+    _flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+threading.Thread(target=_start_flask, daemon=True).start()
+
+init_db()
+
+bot = telebot.TeleBot(API_TOKEN)
+
+MAIN_MENU_IMAGE_ID = None   # set via config.py: MENU_IMAGE_ID = "your_file_id"
+try:
+    from config import MENU_IMAGE_ID as _saved_img
+    MAIN_MENU_IMAGE_ID = _saved_img
+except ImportError:
+    pass
+
+# ── Per-product images ─────────────────────────────────────────────────────────
+import os as _os
+IMAGES_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "images")
+_os.makedirs(IMAGES_DIR, exist_ok=True)
+_PRODUCT_IMAGE_CACHE = {}   # product_name → telegram file_id (cached after first upload)
+
+def _sanitize_image_name(name):
+    import re, unicodedata
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+    return name + ".jpg"
+
+def get_product_image(product_name):
+    """Return (cached_file_id_or_None, local_path_or_None) for a product image."""
+    if product_name in _PRODUCT_IMAGE_CACHE:
+        return _PRODUCT_IMAGE_CACHE[product_name], None
+    filename = _sanitize_image_name(product_name)
+    path = _os.path.join(IMAGES_DIR, filename)
+    if _os.path.exists(path):
+        return None, path
+    return None, None
+MONERO_ADDRESS  = "49Jw8wYfvXC9LYcmh3wb5jWHiTz9ScQjdaAVrEhG5MFod46EMSrWRpjErBxPqSsqwxBbjCqiRMH1nHDfcsek9GXEEmCQNnx"
+BITCOIN_ADDRESS = "1GmsZn2MXFVa1X6W9wjYhsuyAgb1sxb2w3"
+LITECOIN_ADDRESS = "LfGv9EGdvDjPXbRsFn3BCybgWZ1qKSCyKk"
+
+def passphrase_entry_content():
+    """Image 3: Prompt user to type their secret phrase"""
+    text = ("<b>Send your phrase to the chat in one message.</b> The phrase must be 4–100 characters.\n\n"
+            "⚠️ <b>WE WILL NEVER ASK FOR YOUR PASSPHRASE AGAIN! BEWARE OF IMPOSTERS!</b>")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("About secret phrase", callback_data="about_secret_phrase"))
+    return text, kb
+
+def generate_secret_phrase():
+    """Generate a random secret phrase for phishing protection"""
+    chars = string.ascii_letters + string.digits + "[]]{}_-+=!@#$%"
+    return ''.join(random.choice(chars) for _ in range(20))
+
+def store_secret_phrase(chat_id, phrase):
+    """Store secret phrase in database"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute(
+            '''INSERT INTO user_emoji (chat_id, emoji) VALUES (?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET emoji=excluded.emoji''',
+            (chat_id, phrase)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except:
+        pass
+
+
+def passphrase_about_content():
+    """Image 2: About the secret phrase system"""
+    text = ("The <b>secret phrase system</b> is made to <b>protect</b> you from being scammed using fake bots.\n\n"
+            "1. No one else will know your passphrase, and it is important to <b>remember</b> and <b>always check</b> "
+            "that your correct <b>passphrase</b> is shown when using our bots.\n"
+            "2. If a Tesseract vendor decides to disconnect their bot from the market, you can avoid being scammed "
+            "by making sure the <b>passphrase</b> is still <b>correct</b>.\n\n"
+            "The <b>first time</b> you use the bot you will be asked to enter your passphrase. This passphrase will "
+            "be displayed <b>each time in each Tesseract bot</b>, after the /start command, when you "
+            "<b>create an order</b> and <b>open a chat</b>.\n\n"
+            "There are many bots on Telegram so please be cautious when using any of them, especially ones that "
+            "aren't affiliated with Tesseract. We won't be held responsible if you are scammed by a fake bot, "
+            "these measures are in place to help as much as we are able.")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("I understand", callback_data="passphrase_about_understood"))
+    return text, kb
+
+def passphrase_intro_content():
+    """Image 1: Secret phrase setup prompt"""
+    text = ("🔑 <b>You need to set a secret phrase to access the bot.</b>\n\n"
+            "This will then appear with every verified bot. The secret phrase allows you to stay safe "
+            "and buy only from verified stores.")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Set your own secret phrase", callback_data="set_secret_phrase"))
+    kb.add(types.InlineKeyboardButton("About secret phrase", callback_data="about_secret_phrase"))
+    return text, kb
+
+
+def passphrase_confirmation_content(phrase):
+    """Image 4: Confirm the user's saved secret phrase"""
+    text = (f"🔑 <b>Your Secret Phrase: {phrase}</b>\n\n"
+            "🔑 This phrase was set when you first launched the official Tesseract bot from "
+            "<a href=\"https://tsbots.to\">tsbots.to</a>. If it doesn't match or you had to create "
+            "a new one, you may be using a scam bot.\n\n"
+            "Is this your correct secret phrase and did you get the bot link from "
+            "<a href=\"https://tsbots.to\">tsbots.to</a>?")
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("Yes", callback_data="phrase_verified"),
+        types.InlineKeyboardButton("No", callback_data="phrase_denied")
+    )
+    return text, kb
+
+def safety_warning_content():
+    """Image 5: Safety warning"""
+    text = ("⚠️ <b>AVOID ALL ACCOUNTS MESSAGING YOU PRIVATELY.</b>\n\n"
+            "Payments are only accepted through this bot, and the vendor can only be contacted via "
+            "the Contact button here. If unsure, confirm with our community in the public chat.\n\n"
+            "Do not trust or reply to anyone asking for payment or contact outside this bot.")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("I understand and agree", callback_data="safety_agreed"))
+    kb.add(types.InlineKeyboardButton("Need more help?", url="https://telegra.ph/We-moved-our-chats-over-to-Element-X-01-29"))
+    return text, kb
+
+def group_chats_content():
+    """Image 6: Group chats announcement"""
+    text = ("🚀 <b>THE TESSERACT GROUP CHATS</b> moved to our own private servers, so they can't keep "
+            "getting reported and deleted all the time.\n\n"
+            "💬 Less scammers, permanent chats, and no more censorship.\n\n"
+            "📌 Want to join? Follow the guide below.")
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Guide", url="https://telegra.ph/We-moved-our-chats-over-to-Element-X-01-29"))
+    kb.add(types.InlineKeyboardButton("I understand", callback_data="group_chats_understood"))
+    return text, kb
+
+
+def chat_closed_content():
+    """Chat closed message"""
+    text = """📬 <b>Chat with the seller is closed.</b>
+
+Wait until the seller sees and responds to your messages."""
+    
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("Reopen the Chat", callback_data="reopen_chat"),
+        types.InlineKeyboardButton("History Of Chat", callback_data="chat_history")
+    )
+    kb.add(types.InlineKeyboardButton("Menu", callback_data="main_back"))
+    return text, kb
+
+def chat_history_content(chat_id):
+    """Display chat history"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute(
+            "SELECT sender, message, timestamp FROM chat_messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20",
+            (chat_id,)
+        )
+        messages = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if messages:
+            text = "<b>📜 Chat History</b>\n\n"
+            for sender, msg, ts in reversed(messages):
+                from datetime import datetime
+                time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
+                text += f"<b>{sender}</b> ({time_str}):\n{msg}\n\n"
+        else:
+            text = "<b>📜 Chat History</b>\n\nNo messages yet."
+    except:
+        text = "<b>📜 Chat History</b>\n\nNo messages yet."
+    
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Back", callback_data="contact"))
+    return text, kb
+
+def payment_received_content(invoice_num, crypto_amount, crypto_symbol, chat_id):
+    """Display payment received confirmation"""
+    text = (f"✅ <b>Payment received!</b>\n"
+            f"Invoice #{invoice_num} — {crypto_amount} {crypto_symbol}\n"
+            f"User: {chat_id}")
+    
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Close", callback_data="payment_close"))
+    return text, kb
+
+def order_cancelled_content(invoice_num):
+    """Order cancelled due to timeout"""
+    text = f"""❌ <b>Order {invoice_num} has been cancelled.</b>
+
+Payment has not been received within 3 hours.
+
+If you still want to purchase, please create a new order."""
+    
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("Order Details", callback_data="orders"),
+        types.InlineKeyboardButton("Menu", callback_data="main_back")
+    )
+    return text, kb
+
+
+def add_review(rating, amount, product, review_text, date_time):
+    """Add a review to the database"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute("SELECT COUNT(*) FROM reviews")
+        total_reviews = cursor.fetchone()[0]
+        page_number = (total_reviews // REVIEWS_PER_PAGE) + 1
+        cursor.execute(
+            "INSERT INTO reviews (rating, amount, product, review_text, date_time, page_number, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rating, amount, product, review_text, date_time, page_number, time.time())
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error adding review: {e}")
+        return False
+
+REVIEWS_PER_PAGE = 10
+
+def get_reviews_page(page_number=1, filter_stars=None, filter_product=None):
+    """Get REVIEWS_PER_PAGE reviews for a specific page with optional star/product filters."""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        conditions = []
+        params = []
+        if filter_stars is not None:
+            conditions.append("rating = ?")
+            params.append(filter_stars)
+        if filter_product:
+            conditions.append("product LIKE ?")
+            params.append(f"%{filter_product}%")
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        cursor.execute(f"SELECT COUNT(*) FROM reviews {where}", params)
+        total = cursor.fetchone()[0]
+        offset = (page_number - 1) * REVIEWS_PER_PAGE
+        cursor.execute(
+            f"SELECT rating, amount, product, review_text, date_time FROM reviews {where} ORDER BY added_at DESC LIMIT {REVIEWS_PER_PAGE} OFFSET ?",
+            params + [offset]
+        )
+        reviews = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return reviews, total
+    except Exception as e:
+        logging.error(f"Error getting reviews: {e}")
+        return [], 0
+
+
+def get_star_counts(filter_product=None):
+    """Return dict {star: count} for reviews, optionally filtered by product."""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        if filter_product:
+            cursor.execute(
+                "SELECT rating, COUNT(*) FROM reviews WHERE product LIKE ? GROUP BY rating",
+                (f"%{filter_product}%",)
+            )
+        else:
+            cursor.execute("SELECT rating, COUNT(*) FROM reviews GROUP BY rating")
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {r: c for r, c in rows}
+    except Exception as e:
+        logging.error(f"Error getting star counts: {e}")
+        return {}
+
+
+def seed_reviews_db():
+    """Seed REVIEWS_DATA into the DB only if the table is empty."""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute("SELECT COUNT(*) FROM reviews")
+        count = cursor.fetchone()[0]
+        if count == 0:
+            for i, (rating, amount, product, review_text, date_time) in enumerate(REVIEWS_DATA):
+                cursor.execute(
+                    "INSERT INTO reviews (rating, amount, product, review_text, date_time, page_number, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (rating, amount, product, review_text, date_time, (i // REVIEWS_PER_PAGE) + 1, float(i))
+                )
+            conn.commit()
+            logging.info(f"✅ Seeded {len(REVIEWS_DATA)} reviews into DB")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error seeding reviews: {e}")
+
+def ratings_content(page_number=1, filter_stars=None, filter_product=None, back_callback="main_back"):
+    """Display ratings/reviews with star-filter row and page-number row."""
+    reviews, total_reviews = get_reviews_page(page_number, filter_stars, filter_product)
+    star_counts = get_star_counts(filter_product)
+
+    # Build header
+    total_count = 3857
+    monthly = 158
+    weekly = 33
+
+    if filter_product:
+        header = f"📈 <b>Reviews for {filter_product}</b>\n"
+        header += f"<b>Found {total_reviews} review(s)</b>\n\n"
+    else:
+        showing_count = min(page_number * REVIEWS_PER_PAGE, total_reviews) if total_reviews else 0
+        header = f"📈 <b>Showing {showing_count} out of {total_count} all reviews</b>\n"
+        header += f"<b>Total / Monthly / Weekly = {total_count} / +{monthly} / +{weekly}</b>\n\n"
+
+    back_label = "Back to Menu" if back_callback == "main_back" else "⬅️ Back to Product"
+
+    if total_reviews == 0:
+        text = "✅ No reviews found for this filter."
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("All ★", callback_data="rstar_all_1"))
+        kb.add(types.InlineKeyboardButton(back_label, callback_data=back_callback))
+        return text, kb
+
+    text = header
+    for rating, amount, product, review_text, date_time in reviews:
+        stars = "★" * rating + "☆" * (5 - rating)
+        text += f"<b>{date_time} {stars} — £{amount:.2f}</b>\n<a href=\"https://t.me/\">{product}</a>\n↳ {review_text}\n\n"
+
+    kb = types.InlineKeyboardMarkup()
+    total_pages = max(1, (total_reviews + REVIEWS_PER_PAGE - 1) // REVIEWS_PER_PAGE)
+
+    # Encode product filter in callbacks
+    pf = filter_product or ""
+    sf = str(filter_stars) if filter_stars else "all"
+
+    # Row 1: Star filter buttons
+    row1 = []
+    all_label = "[ All★ ]" if filter_stars is None else "All★"
+    row1.append(types.InlineKeyboardButton(all_label, callback_data=f"rstar_all_1" + (f"_pf_{pf}" if pf else "")))
+    for s in [5, 4, 3, 2, 1]:
+        cnt = star_counts.get(s, 0)
+        label = f"[{s}★({cnt})]" if filter_stars == s else f"{s}★({cnt})"
+        row1.append(types.InlineKeyboardButton(label, callback_data=f"rstar_{s}_1" + (f"_pf_{pf}" if pf else "")))
+    kb.row(*row1)
+
+    # Row 2: Page number buttons
+    row2 = []
+    window_start = max(1, min(page_number - 2, total_pages - 4))
+    window_end = min(window_start + 4, total_pages)
+    for p in range(window_start, window_end + 1):
+        lbl = f"[ {p} ]" if p == page_number else str(p)
+        row2.append(types.InlineKeyboardButton(lbl, callback_data=f"rpage_{p}_{sf}" + (f"_pf_{pf}" if pf else "")))
+    if total_pages > window_end:
+        row2.append(types.InlineKeyboardButton(f"{total_pages}»", callback_data=f"rpage_{total_pages}_{sf}" + (f"_pf_{pf}" if pf else "")))
+    kb.row(*row2)
+
+    kb.add(types.InlineKeyboardButton(back_label, callback_data=back_callback))
+    return text, kb
+
+def get_product_reviews(product_name):
+    """Get all reviews for a specific product"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute(
+            "SELECT rating, amount, product, review_text, date_time FROM reviews WHERE product LIKE ? ORDER BY added_at DESC",
+            (f"%{product_name}%",)
+        )
+        reviews = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return reviews
+    except Exception as e:
+        logging.error(f"Error getting product reviews: {e}")
+        return []
+
+def product_reviews_content(product_name, back_callback="main_back"):
+    """Display reviews for a specific product."""
+    reviews = get_product_reviews(product_name)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("← Back", callback_data=back_callback))
+
+    if not reviews:
+        text = f"⭐ <b>Reviews for {product_name}</b>\n\nNo reviews found for this product yet."
+        return text, kb
+
+    review_count = len(reviews)
+    text = f"⭐ <b>Reviews for {product_name}</b>\n"
+    text += f"<b>{review_count} review(s)</b>\n\n"
+
+    for rating, amount, product, review_text, date_time in reviews[:15]:
+        stars = "★" * rating + "☆" * (5 - rating)
+        text += f"{stars} — £{amount:.2f}\n⤷ {review_text}\n{date_time}\n\n"
+
+    return text, kb
+
+def add_review_to_db(rating, amount, product, review_text, date_time):
+    """Add a new review to the database"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute("SELECT COUNT(*) FROM reviews")
+        total = cursor.fetchone()[0]
+        page_number = (total // REVIEWS_PER_PAGE) + 1
+        cursor.execute(
+            "INSERT INTO reviews (rating, amount, product, review_text, date_time, page_number, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rating, amount, product, review_text, date_time, page_number, time.time())
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error adding review: {e}")
+        return False
+
+def add_rating_to_db(rating, comment):
+    """Add a simple rating to the database"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute("SELECT COUNT(*) FROM reviews")
+        total = cursor.fetchone()[0]
+        page_number = (total // REVIEWS_PER_PAGE) + 1
+        cursor.execute(
+            "INSERT INTO reviews (rating, amount, product, review_text, date_time, page_number, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rating, 0.0, "⭐ Rating", comment, "Admin Added", page_number, time.time())
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error adding rating: {e}")
+        return False
+
+def add_rating_to_db_with_product(rating, comment, product):
+    """Add a rating with product details to the database"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute("SELECT COUNT(*) FROM reviews")
+        total = cursor.fetchone()[0]
+        page_number = (total // REVIEWS_PER_PAGE) + 1
+        cursor.execute(
+            "INSERT INTO reviews (rating, amount, product, review_text, date_time, page_number, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rating, 0.0, product, comment, "Customer Review", page_number, time.time())
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error adding rating: {e}")
+        return False
+
+# Global states for admin review submission
+admin_review_state = {}
+
+def admin_send_reviews_content():
+    """Admin review submission interface"""
+    text = (
+        "📝 <b>Send Review</b>\n\n"
+        "Please enter the review details in this format:\n\n"
+        "<code>RATING|AMOUNT|PRODUCT|REVIEW_TEXT|DATE_TIME</code>\n\n"
+        "Example:\n"
+        "<code>5|185.00|🚀 7g for £185 (HQ)|Great product and fast delivery|20 Jun, 2026 at 10:30</code>\n\n"
+        "RATING: 1-5 stars\n"
+        "AMOUNT: Price in £\n"
+        "PRODUCT: Product description with emoji\n"
+        "REVIEW_TEXT: Customer review\n"
+        "DATE_TIME: Date and time"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Cancel", callback_data="admin_back"))
+    return text, kb
+
+def admin_add_rating_content():
+    """Admin rating submission interface"""
+    text = (
+        "⭐ <b>Add Rating</b>\n\n"
+        "Send the review in this exact format:\n\n"
+        "<code>DATE|STARS|AMOUNT|PRODUCT|REVIEW_TEXT</code>\n\n"
+        "Example:\n"
+        "<code>27 Jun, 2026 at 23:01|5|70.00|🏆 *LIMITED DEAL* 3.5g for £70 (Premium Sociable)|A* cheers pop eye</code>\n\n"
+        "DATE: e.g. 27 Jun, 2026 at 23:01\n"
+        "STARS: 1-5\n"
+        "AMOUNT: e.g. 70.00\n"
+        "PRODUCT: product name with emoji\n"
+        "REVIEW_TEXT: the review"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Cancel", callback_data="admin_back"))
+    return text, kb
+
+# Global state for admin rating submission
+admin_rating_state = {}
+
+# Global chat tracking for contact messages
+user_chat_closed = set()
+
+def log_chat_message(chat_id, sender, message):
+    """Log message to chat history"""
+    try:
+        conn = get_db_connection()
+        cursor = _get_cursor(conn)
+        cursor.execute(
+            "INSERT INTO chat_messages (chat_id, sender, message, timestamp) VALUES (?, ?, ?, ?)",
+            (chat_id, sender, message, time.time())
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except:
+        pass
+
+def notify_admin_message(chat_id, user_name, user_username, message):
+    """Notify admin of user message with a Reply button."""
+    try:
+        text = (f"📨 <b>New Message from User</b>\n\n"
+                f"<b>Name:</b> {user_name}\n"
+                f"<b>Username:</b> @{user_username}\n"
+                f"<b>Chat ID:</b> {chat_id}\n\n"
+                f"<b>Message:</b>\n{message}")
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton(f"↩️ Reply to {user_name}", callback_data=f"reply_user_{chat_id}"))
+        bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=kb)
+        log_chat_message(chat_id, user_name, message)
+    except:
+        pass
+
+def notify_admin_payment(chat_id, user_name, product_name, amount, method, invoice=None):
+    """Notify admin of payment initiation with confirm button."""
+    try:
+        invoice_line = f"<b>Invoice #:</b> {invoice}\n" if invoice else ""
+        text = (f"💳 <b>Payment Initiated</b>\n\n"
+                f"{invoice_line}"
+                f"<b>User:</b> {user_name}\n"
+                f"<b>Chat ID:</b> <code>{chat_id}</code>\n"
+                f"<b>Products:</b> {product_name}\n"
+                f"<b>Amount:</b> £{amount}\n"
+                f"<b>Method:</b> {method}\n\n"
+                f"⏳ Awaiting payment — confirm below once received.")
+        kb = types.InlineKeyboardMarkup()
+        if invoice:
+            kb.row(
+                types.InlineKeyboardButton("✅ Confirm Payment Received", callback_data=f"admin_confirm_pay_{invoice}"),
+            )
+            kb.row(
+                types.InlineKeyboardButton(f"📨 Message {user_name}", callback_data=f"reply_user_{chat_id}")
+            )
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=kb)
+    except:
+        pass
+ADMIN_CHAT_ID = 8446035334   # primary — receives all notifications
+ADMIN_IDS = {8446035334, 8782313089}
+
+# ── Discount codes {code: % off} ─────────────────────────────────────────────
+PRESET_DISCOUNT_CODES = {
+    "10ketrock": 10.0,   # 10% off
+}
+
+# ── Crypto wallet addresses (set your own) ────────────────────────────────────
+CRYPTO_ADDRESSES = {
+    "Bitcoin":  "1GmsZn2MXFVa1X6W9wjYhsuyAgb1sxb2w3",
+    "Litecoin": "LfGv9EGdvDjPXbRsFn3BCybgWZ1qKSCyKk",
+    "Monero":   "CD8FPz5EzBi5j4MpuPxm293Bq5Qb2jx2pRH2HanB3byr",
+}
+
+# ── Crypto exchange rates (GBP per 1 coin) — update regularly ─────────────────
+CRYPTO_RATES_GBP = {
+    "Bitcoin":  48000.0,
+    "Litecoin": 50.0,
+    "Monero":   150.0,
+}
+CRYPTO_SYMBOLS = {
+    "Bitcoin":  "BTC",
+    "Litecoin": "LTC",
+    "Monero":   "XMR",
+}
+
+# ── State tracking ─────────────────────────────────────────────────────────────
+waiting_for_phrase   = set()   # chat_ids currently being asked to type their phrase
+waiting_for_qty      = set()   # chat_ids currently typing a manual quantity
+waiting_for_address  = set()   # chat_ids currently typing their delivery address
+waiting_for_discount = set()   # chat_ids currently typing a discount code
+first_time_setup     = set()
+user_cart            = {}      # chat_id → list of {name, qty, unit, price_each, line_total}
+user_product_state   = {}      # chat_id → {product, qty, msg_id}
+user_payment_method  = {}      # chat_id → "Bitcoin" | "Litecoin" | "Monero"
+user_address         = {}      # chat_id → delivery address string
+user_delivery        = {}      # chat_id → delivery method string
+user_discount        = {}      # chat_id → discount percentage float
+user_discount_code   = {}      # chat_id → discount code string
+
+def get_cart_total(chat_id):
+    return sum(i["line_total"] for i in user_cart.get(chat_id, []))
+
+def get_delivery_fee(method):
+    if not method:
+        return 0.0
+    try:
+        return float(method.split("£")[-1])
+    except Exception:
+        return 0.0
+
+# ── Product details catalogue ──────────────────────────────────────────────────
+PRODUCT_DETAILS = {
+    "Alprazolam Xanax Alxan 1mg": {
+        "cat": "Benzos", "subcat": "Pills",
+        "stock": "Unlimited", "rating": 4.6, "reviews": 26,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "Genuine blister Medicross Alxan 1mg. You will receive exactly the same strips as in the photo.\n\n"
+            "20pcs = 1strip - Go up in increments of 20pcs\n\n"
+            "Alprazolam is a downer belonging to the benzodiazepine class. It is fast acting, making it great "
+            "for treating panic attacks and anxiety as well as for killing a psychedelic trip or for attenuating "
+            "a stimulant comedown.\n\n"
+            "Dosage\nLight: 0.25mg - 0.5mg\nCommon: 0.5mg - 1.5mg\nStrong: 1.5mg - 2mg\n"
+            "Heavy: 2mg - 3mg+ (BLACKOUTS MAY OCCUR)\n\nMore info can be found at"
+        ),
+        "tiers": [(1, 11.50), (3, 10.00), (5, 9.50), (10, 9.00), (20, 8.00), (50, 7.00), (100, 6.00)],
+    },
+    "Diazepam Valium 10mg (Martin Dows)": {
+        "cat": "Benzos", "subcat": "Pills",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 512,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "Genuine blister Martin Dows. You will receive exactly the same strips as in the photo.\n\n"
+            "1x strip = 10 pills.\n\n"
+            "Effects include disinhibition, sedation, muscle relaxation and appetite enhancement. As with most "
+            "downers, it also causes respiratory depression so it is not be mixed with other downers as it can "
+            "lead to an accidental overdose.\n\n"
+            "Dosage\nLight: 2.5mg - 5mg\nCommon: 5mg - 15mg\nStrong: 15mg - 30mg\n"
+            "Heavy: 30mg+ (BLACKOUTS MAY OCCUR)\n\n"
+            "More info can be found at https://psychonautwiki.org/wiki/Diazepam"
+        ),
+        "tiers": [(1, 11.00), (3, 10.00), (5, 8.00), (10, 7.00), (20, 6.00), (50, 5.50)],
+    },
+    # ── Sweet Edibles (shared desc / tiers) ──────────────────────────────────
+    "🍬 500mg RELAX Edibles - Cherry 🍒": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.7, "reviews": 23,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Cola Bottles 🥤": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 25,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Pina Colada 🍹": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 12,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Pineapple 🍍": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.6, "reviews": 5,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Apple 🍎🍏": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.3, "reviews": 4,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Strawberry 🍓": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 16,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Orange & Lemon 🍊🍋": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.7, "reviews": 9,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Mixed Berries 🫐🍒": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.6, "reviews": 8,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Watermelon 🍉": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.3, "reviews": 11,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    "🍬 500mg RELAX Edibles - Blue Raspberry 🔷": {
+        "cat": "Cannabis", "subcat": "Sweet Edibles",
+        "stock": "Unlimited", "rating": 4.5, "reviews": 8,
+        "desc": (
+            "IF YOU WOULD LIKE TO MIX AND MATCH YOUR FLAVORS WRITE IN NOTES\n\n"
+            "5 Pieces per packet.\n\n"
+            "Flavours:\n\nStrawberry 🍓\nOrange & Lemon 🍊🍋\nMixed Berries 🫐🍒\nWatermelon 🍉\n"
+            "Blue Raspberry 🔷\nApple 🍎🍏\nPineapple 🍍\nPina Colada 🍹\nCola Bottles 🥤\nCherry 🍒\n\n"
+            "Elevate your downtime with RELAX Edibles, a premium selection of gourmet-infused treats designed "
+            "for ultimate serenity and subtle euphoria. Each pack delivers a potent 500mg dose of premium THC "
+            "Crafted from organically sourced, lab-tested cannabinoids, these"
+        ),
+        "tiers": [(1, 15.00), (2, 14.00), (5, 13.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+    # ── Psychedelic ───────────────────────────────────────────────────────────
+    "🌈 Dr Seuss - DS3 XTAL - 200ug LSD 🌈": {
+        "cat": "Psychedelic", "subcat": "LSD",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 28,
+        "unit": "pcs", "step": 5.0,
+        "desc": (
+            "200ug Dr Suess tabs, made with 99% Needlepoint Crystal LSD.\n\n"
+            "These tabs hit hard. They are made with very pure acid for a lovely clean trip.\n\n"
+            "Take half if youre a beginner!"
+        ),
+        "tiers": [(5, 4.70), (10, 4.10), (25, 3.65), (50, 3.25), (100, 2.85), (250, 2.74), (500, 2.63), (1000, 2.52), (2500, 2.40)],
+    },
+    "🌈 100ug Dr Suess Acid (LSD) 🌈": {
+        "cat": "Psychedelic", "subcat": "LSD",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 41,
+        "unit": "pcs", "step": 5.0,
+        "desc": (
+            "100ug Dr Suess tabs, made with 99% Needlepoint Crystal LSD.\n\n"
+            "These tabs hit hard. They are made with very pure acid for a lovely clean trip.\n\n"
+            "Take half if youre a beginner!"
+        ),
+        "tiers": [(5, 3.75), (10, 2.90), (25, 2.00), (50, 1.60), (100, 1.50), (250, 1.42), (500, 1.35), (1000, 1.19), (2000, 1.13), (5000, 1.05)],
+    },
+    # ── Sleep / Anxiety ───────────────────────────────────────────────────────
+    "Zopiclone HAB 7.5mg": {
+        "cat": "Sleep / Anxiety", "subcat": "",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 47,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "Genuine blister Zopiclone HAB 7.5mg. You will receive exactly the same strips as in the photo.\n\n"
+            "10pcs = 1strip - Go up in increments of 10pcs per time.\n\n"
+            "Dosage\nLight: 3.5 - 5 mg\nCommon: 5 - 7.5 mg\nStrong: 7.5 - 15 mg\nHeavy: 15 mg +\n\n"
+            "More info can be found at https://psychonautwiki.org/wiki/Zopiclone"
+        ),
+        "tiers": [(1, 5.25), (2, 5.00), (5, 4.40), (10, 3.50), (20, 2.90), (50, 2.60), (100, 2.40)],
+    },
+    # ── Dissociatives / Ketamine ──────────────────────────────────────────────
+    "🟥 Red Label Long shard Needles (S-Isomer)": {
+        "cat": "Dissociatives", "subcat": "Ketamine",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 361,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "-Red Label Long shard ket, beautiful shards.\n\n"
+            "S-Isomer Ketamine needles, Wonky shards that put you in a hole if you are not careful.\n\n"
+            "Lots and lots of cheap shit ket going around, this is not it.\n\n"
+            "Pure Indian ketamine needles.\n\n"
+            "10/10"
+        ),
+        "tiers": [(1, 14.00), (2, 11.00), (3.5, 8.90), (7, 7.10), (14, 5.50), (28, 4.80), (56, 3.90), (100, 3.30), (250, 2.80), (500, 2.50), (1000, 2.20), (2000, 1.90)],
+    },
+    "🌌 Astral Ketamine Sand": {
+        "cat": "Dissociatives", "subcat": "Ketamine",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 239,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "Smooth Ketamine Sand, very fine sand/dust powder that goes up smooth and is extremely strong.\n\n"
+            "Lovely wonk."
+        ),
+        "tiers": [(1, 14.00), (2, 12.00), (3.5, 9.50), (7, 7.80), (14, 6.70), (28, 5.70), (56, 4.90), (100, 4.20), (250, 3.20), (500, 2.80), (1000, 2.40)],
+    },
+    "💎 Diamond Rock Ketamine (New Synth)": {
+        "cat": "Dissociatives", "subcat": "Ketamine",
+        "stock": "82,178.50", "rating": 4.9, "reviews": 232,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "New, shiny diamond crystal synth.\n\n"
+            "Very very pure Diamond S-Isomer ket.\n\n"
+            "A lot stronger than a lot of other ket about (which isnt saying much!) - But this ket is a different breed.\n\n"
+            "This is very strong, so be careful of the k hole!"
+        ),
+        "tiers": [(1, 23.00), (2, 18.00), (3.5, 14.00), (7, 11.30), (14, 9.90), (28, 9.50), (56, 8.80), (100, 8.50), (250, 8.35)],
+    },
+    "🙏 Buddha Ketamine Needles (S-Isomer)": {
+        "cat": "Dissociatives", "subcat": "Ketamine",
+        "stock": "83,022.70", "rating": 4.9, "reviews": 427,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "The best of the best needles. Buddha batch.\n\n"
+            "S-Isomer Ketamine needles, Wonky shards that put you in a hole if you are not careful.\n\n"
+            "Lots and lots of cheap shit ket going around, this is not it.\n\n"
+            "Pure Indian ketamine needles.\n\n"
+            "10/10"
+        ),
+        "tiers": [(1, 15.00), (2, 12.50), (3.5, 9.30), (7, 7.80), (14, 6.10), (28, 5.20), (56, 4.40), (100, 3.60), (250, 3.30), (500, 2.90), (1000, 2.50)],
+    },
+    # ── Dissociatives / Quattro Forketti Bundle ───────────────────────────────
+    "4x3.5g Bundle (30% OFF)": {
+        "cat": "Dissociatives", "subcat": "🍕 Quattro Forketti Bundle",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 62,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "Normally £158, now £110 - 30% OFF!\n\n"
+            "3.5 gram of each:\n\n"
+            "-🙏 Buddha Ketamine Needles (S-Isomer)\n"
+            "-🟥 Red Label Long shard Needles (S-Isomer)\n"
+            "-💎 Diamond Rock Ketamine (New Synth)\n"
+            "-🌌 Astral Ketamine Sand\n\n"
+            "Find pics of each type of ket on their own listings! :)"
+        ),
+        "tiers": [(1, 110.00)],
+    },
+    "4x1g Bundle (40% OFF)": {
+        "cat": "Dissociatives", "subcat": "🍕 Quattro Forketti Bundle",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 95,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "Normally £75 now £45 - 40% OFF!\n\n"
+            "1 gram of each:\n\n"
+            "-🙏 Buddha Ketamine Needles (S-Isomer)\n"
+            "-🟥 Red Label Long shard Needles (S-Isomer)\n"
+            "-💎 Diamond Rock Ketamine (New Synth)\n"
+            "-🌌 Astral Ketamine Sand\n\n"
+            "Find pics of each type of ket on their own listings! :)"
+        ),
+        "tiers": [(1, 45.00)],
+    },
+    # ── Dissociatives / GBL ───────────────────────────────────────────────────
+    "99.9% GBL - Liquid XTC (Up to 25L) 💧 ✨": {
+        "cat": "Dissociatives", "subcat": "GBL",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 160,
+        "unit": "ml", "step": 30.0,
+        "desc": (
+            "QUANTITIES OF 30/60/100ML ONLY. You can order 160ml /230ml/1000ml for example.\n\n"
+            "This is a listing for 99.9% pharmaceutical grade GBL - NOT GHB.\n\n"
+            "GBL is described as \"Liquid XTC\" by many, a mix of alcohol and ecstasy, without any hangover (or calories!)\n\n"
+            "GBL converts in to GHB in the body. 1ml GBL = 1.6ml GHB.\n\n"
+            "Very fun drug, but very dose dependent. You MUST read up on proper dosage before hand.\n"
+            "https://wiki.tripsit.me/wiki/GHB\n\n"
+            "If you order 4 or more litres, please message us first to arrange"
+        ),
+        "tiers": [(30, 0.92), (60, 0.84), (100, 0.75), (260, 0.74), (500, 0.60), (1000, 0.51), (2000, 0.45), (5000, 0.40), (10000, 0.35), (25000, 0.30)],
+    },
+    # ── Quaaludes ─────────────────────────────────────────────────────────────
+    "🍋 Quaaludes - Lemmon 714 🍋": {
+        "cat": "🍋 Quaaludes 🍋", "subcat": "",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 263,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "You arent dreaming, these are Quaaludes with 330mg of 2-Methoxyqualone in them.\n\n"
+            "Extremely rare product.\n\n"
+            "WEDINOS code: W071848\n\n"
+            "2-Methoxyqualone is an analogue extremely similar to the real Methaqualone, producing almost identical effects.\n\n"
+            "Famously shown in Wolf of Wall street, they have been described as benzos with a party twist.\n\n"
+            "A really fun drug that was once lost in time, now its back!\n\n"
+            "Enjoy friends!"
+        ),
+        "tiers": [(1, 10.00), (3, 8.00), (5, 7.50), (10, 7.00), (25, 6.50), (50, 6.00), (100, 5.00), (250, 4.50), (500, 4.00), (1000, 3.30)],
+    },
+    # ── Mushrooms ─────────────────────────────────────────────────────────────
+    "💧 Shroom Drops 🍄 Vanilla Flavour 🌈": {
+        "cat": "Psychedelic", "subcat": "Mushrooms",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 229,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "GREAT reseller.\n\n"
+            "Each bottle contains 4 x 3.5g shroom trips, with 40-50 drops total.\n\n"
+            "RRP £90+ per bottle. 💸\n\n"
+            "You can easily take a few delicious drops for a light giggly experience, or get in to 8-12 drops and start a real trip!\n\n"
+            "Vanilla flavoured. 🧁\n\n"
+            "Small inconspicuous dropper bottle.\n\n"
+            "Enjoy!"
+        ),
+        "tiers": [(1, 45.00), (2, 42.50), (5, 40.00), (10, 38.00), (25, 36.00)],
+    },
+    "🍄 Machine Elf Whole Mushrooms 🍄": {
+        "cat": "Psychedelic", "subcat": "Mushrooms",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 14,
+        "unit": "gr", "step": 3.5,
+        "desc": "Whole magic mushrooms, very nice bruising, grown with care.",
+        "tiers": [(3.5, 7.50), (7.0, 6.40), (14.0, 5.00), (28.0, 4.15), (56.0, 3.75), (100.0, 3.55), (250.0, 3.25), (500.0, 2.80), (1000.0, 2.25)],
+    },
+    "🍄 Tidal Wave #4 Whole Mushrooms 🍄": {
+        "cat": "Psychedelic", "subcat": "Mushrooms",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 58,
+        "unit": "gr", "step": 3.5,
+        "desc": "Whole magic mushrooms, very nice bruising, grown with care.",
+        "tiers": [(3.5, 7.50), (7.0, 6.55), (14.0, 5.65), (28.0, 4.60), (56.0, 3.90), (100.0, 3.55), (250.0, 3.25), (500.0, 2.80), (1000.0, 2.25)],
+    },
+    "🍄 Albino Hillbilly Pumpkin Whole Mushrooms 🍄": {
+        "cat": "Psychedelic", "subcat": "Mushrooms",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 32,
+        "unit": "gr", "step": 3.5,
+        "desc": "Whole magic mushrooms, very nice bruising, grown with care.",
+        "tiers": [(3.5, 7.50), (7.0, 6.55), (14.0, 5.65), (28.0, 4.60), (56.0, 3.90), (100.0, 3.55), (250.0, 3.25), (500.0, 2.80), (1000.0, 2.25)],
+    },
+    "🍄 Albino Penis Envy Whole Mushrooms 🍄": {
+        "cat": "Psychedelic", "subcat": "Mushrooms",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 65,
+        "unit": "gr", "step": 3.5,
+        "desc": "Whole magic mushrooms, very nice bruising, grown with care.",
+        "tiers": [(3.5, 7.50), (7.0, 6.55), (14.0, 5.65), (28.0, 4.60), (56.0, 3.90), (100.0, 3.55), (250.0, 3.25), (500.0, 2.80), (1000.0, 2.25)],
+    },
+    "💧 2C-B Drops - 125mg 🐝 Candy Flavour 🍭": {
+        "cat": "Psychedelic", "subcat": "2C-B",
+        "stock": "Unlimited", "rating": 4.5, "reviews": 20,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "GREAT reseller.\n\n"
+            "Each bottle contains 125mg of pure 2C-B powder dissolved, with 80 drops total.\n\n"
+            "RRP £90+ per bottle. 💸\n\n"
+            "You can easily take a few delicious drops for a light giggly experience, or get in to full 2C-B trip with 15-20 drops!\n\n"
+            "Candy flavoured. 🍭 🍬\n\n"
+            "Small inconspicuous dropper bottle.\n\n"
+            "Enjoy!"
+        ),
+        "tiers": [(1, 35.00), (2, 32.50), (5, 29.00), (10, 26.50), (25, 24.00), (50, 22.00), (100, 19.50), (250, 17.00), (500, 15.00)],
+    },
+    "🐝 22mg 2C-B Bumble Bees 💊": {
+        "cat": "Psychedelic", "subcat": "2C-B",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 65,
+        "unit": "pcs", "step": 5.0,
+        "desc": (
+            "Lovely little press this.\n\n"
+            "A real 22mg 2C-B pill, unlike the typical underdosed ones you get this has a proper dose.\n\n"
+            "Very nicely pressed.\n\n"
+            "Pair with our Euphoric MDMA for the nexus flip of your life!"
+        ),
+        "tiers": [(5, 4.40), (10, 3.40), (25, 2.90), (50, 2.30), (100, 1.90), (250, 1.78), (500, 1.62), (1000, 1.40), (2500, 1.30)],
+    },
+    "🐝 Pure 2C-B Powder - HCL 🐝": {
+        "cat": "Psychedelic", "subcat": "2C-B",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 2,
+        "unit": "gr", "step": 0.25,
+        "desc": (
+            "This is pure, slightly off white 2C-B powder, hydrochloride form. More potent than HBr.\n\n"
+            "Great for dosing however you like. Liquid, sweets, or other!"
+        ),
+        "tiers": [(0.25, 180.00), (0.50, 140.00), (1.00, 95.00), (2.00, 86.00), (5.00, 79.00), (10.00, 73.00), (25.00, 65.00)],
+    },
+    # ── Stimulants ────────────────────────────────────────────────────────────
+    "💎 🇳🇱 Clandestine Dutch Ephedrine Meth 🇳🇱 💎": {
+        "cat": "Stimulants", "subcat": "Methamphetamine",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 71,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "Here we have some wonderfully clear Ephedrine made meth on the menu, created in clandestine Dutch labs.\n\n"
+            "An extremely high quality crystal with a focus on purity and cleanliness.\n\n"
+            "The meth quality sits between Iranian and HK and is priced as such.\n\n"
+            "This meth will blow your fucking socks off, gives a crystal clear high and energy and last for hours and hours.\n\n"
+            "Another top quality item to our menu. Enjoy!"
+        ),
+        "tiers": [(1, 30.00), (2, 28.00), (3.5, 26.00), (7, 23.00), (14, 19.00), (28, 15.00), (56, 13.00), (100, 11.50), (250, 10.50), (500, 9.50), (1000, 8.50)],
+    },
+    "💎 🇨🇳 Hong Kong Premium Triads Meth (D-Isomer) 🇨🇳 💎": {
+        "cat": "Stimulants", "subcat": "Methamphetamine",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 131,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "⚠️ Low STOCK! ⚠️ Here we have some wonderfully clear meth (D-Isomer) on the menu, created in premium "
+            "underground Hong Kong labs. An extremely high quality crystal with a focus on purity and cleanliness.\n\n"
+            "This meth will blow your fucking socks off, gives a crystal clear high and energy and last for hours and hours.\n\n"
+            "Another top quality item to our menu. Enjoy!"
+        ),
+        "tiers": [(1, 45.00), (2, 42.50), (3.5, 40.00), (7, 36.00), (14, 32.00), (28, 28.00), (56, 24.00), (100, 20.00)],
+    },
+    "💎 🇮🇷 Iranian Superlab Meth Batch #2 (D-Isomer) 🇮🇷 💎": {
+        "cat": "Stimulants", "subcat": "Methamphetamine",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 610,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "⚠️ New batch - lower prices! ⚠️ Here we have some wonderfully clear meth (D-Isomer) on the menu, created in "
+            "clandestine Iranian Superlabs. An extremely high quality crystal with a focus on purity and cleanliness.\n\n"
+            "This meth will blow your fucking socks off, gives a crystal clear high and energy and last for hours and hours.\n\n"
+            "Another top quality item to our menu. Enjoy!"
+        ),
+        "tiers": [(1, 29.50), (2, 27.50), (3.5, 25.50), (7, 22.50), (14, 18.50), (28, 14.50), (56, 12.50), (100, 11.00), (250, 10.25), (500, 9.40), (1000, 8.40)],
+    },
+    "🇧🇴 Bolivian Cream Cocaine P500 #1 🔥": {
+        "cat": "Stimulants", "subcat": "Cocaine",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 1625,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "New bolivian line P500 #1, really creamy smooth bolivian. Stinks of petrol, oily, strong, shiny and smooth as fuck.\n\n"
+            "Turns to oil as you rub like bolivian should. Clean up the nose and beautiful smooth effects, real quality.\n\n"
+            "Anyone whos tried our ultra clean colombian needs to try this, if you prefer more of a smooth coke rather than power "
+            "colombian it might be your new favourite.\n\n"
+            "You may order a mix of both colombian and bolivian if your order is 7g or above. Just put in address notes that you want"
+        ),
+        "tiers": [(1, 46.00), (2, 43.00), (3.5, 36.80), (7, 34.20), (14, 30.40), (28, 29.40), (56, 28.00), (100, 27.00), (250, 25.50), (500, 24.50), (1000, 23.50)],
+    },
+    "🇨🇴 Colombian Power Coke - LACOSTE #1 🇨🇴": {
+        "cat": "Stimulants", "subcat": "Cocaine",
+        "stock": "68,850.20", "rating": 4.9, "reviews": 1642,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "NEW Colombian Cocaine LACOSTE #1 Brick. Banging colombian. Oily fishscale. 10/10 coke.\n\n"
+            "Clean, powerful shiny colombian coke, not much more needs to be said.\n\n"
+            "You may order a mix of both colombian and bolivian if your order is 7g or above. Just put in address notes that you want "
+            "3.5g bolivian 3.5g colombian on a 7g order for example."
+        ),
+        "tiers": [(1, 46.00), (2, 43.00), (3.5, 36.80), (7, 34.20), (14, 30.40), (28, 29.40), (56, 28.00), (100, 27.00), (250, 25.50), (500, 24.50), (1000, 23.50)],
+    },
+    # ── Opiates ───────────────────────────────────────────────────────────────
+    "Codeine Phosphate Teva 30mg": {
+        "cat": "Opiates", "subcat": "Codeine",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 26,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "Codeine Phosphate Teva 30mg\n\n"
+            "Use & Benefits:\n"
+            " Provides strong pain relief\n"
+            " Promotes mood elevation & relaxation\n"
+            " Increases tolerance to pain\n"
+            " Effective for moderate to severe pain management\n\n"
+            "1x strip = 25x pills"
+        ),
+        "tiers": [(1, 23.00), (2, 21.50), (5, 20.00), (10, 19.00), (20, 18.00), (50, 17.00), (100, 16.00)],
+    },
+    # ── Ecstasy ───────────────────────────────────────────────────────────────
+    "💙 Euphoric Dutch Champagne MDMA 91% 💙": {
+        "cat": "Ecstasy", "subcat": "MDMA",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 424,
+        "unit": "gr", "step": 1.0,
+        "desc": (
+            "Real Dutch Power MDMA. Classic Champagne ecstasy rock right here.\n\n"
+            "Do not be fooled by the weak MDMA going about since the drought, this is proper shit.\n\n"
+            "Our last batch tested at 89% from EC - we expect this one to be in the 90s. PM us for a photo of the result\n\n"
+            "Enjoy ravers!"
+        ),
+        "tiers": [(1, 14.00), (2, 11.00), (3.5, 10.00), (7, 8.80), (14, 7.80), (28, 6.70), (56, 5.90), (100, 5.60)],
+    },
+    # ── Ecstasy Pills ─────────────────────────────────────────────────────────
+    "🟣 Purple Punisher 300mg XTC 🟣": {
+        "cat": "Ecstasy", "subcat": "Pills",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 198,
+        "unit": "pcs", "step": 5.0,
+        "desc": (
+            "Strong accurately dosed Ecstasy coming from NL.\n\n"
+            "Dosed at 300mg, made from the same champagne MDMA as our high purity EC tested MDMA.\n\n"
+            "Purity: 300mg (ACTUAL) pure Champagne MDMA per pill.\n"
+            "Structure: Hard-pressed, firm pills.\n"
+            "Color: Purple\n"
+            "Origin: Netherlands\n\n"
+            "These pills are actually 300mg unlike other pills advertised as such, so be careful and start with half."
+        ),
+        "tiers": [(5, 5.50), (10, 3.90), (25, 3.40), (50, 2.30), (100, 1.95), (250, 1.83), (500, 1.67), (1000, 1.47)],
+    },
+    "⏱️ Tesla 300mg XTC ⏱️": {
+        "cat": "Ecstasy", "subcat": "Pills",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 67,
+        "unit": "pcs", "step": 5.0,
+        "desc": (
+            "Strong accurately dosed Ecstasy coming from NL.\n\n"
+            "Dosed at 300mg, made from the same champagne MDMA as our high purity EC tested MDMA.\n\n"
+            "Purity: 300mg (ACTUAL) pure Champagne MDMA per pill.\n"
+            "Structure: Hard-pressed, firm pills.\n"
+            "Color: Purple\n"
+            "Origin: Netherlands\n\n"
+            "These pills are actually 300mg unlike other pills advertised as such, so be careful and start with half."
+        ),
+        "tiers": [(5, 5.00), (10, 3.90), (25, 3.40), (50, 2.20), (50, 2.30), (100, 1.95), (250, 1.83), (500, 1.65), (1000, 1.47), (2500, 1.35)],
+    },
+    # ── Vapes ─────────────────────────────────────────────────────────────────
+    "🌿 1ml Wizard Trees - Sleeve Cali Vapes - 10 strains ⚡": {
+        "cat": "Cannabis", "subcat": "Vapes",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 33,
+        "unit": "pcs", "step": 1.0,
+        "desc": (
+            "Introducing our 1ml Wizards - Sleeve vapes. Premium Smooth.\n\n"
+            "97%+ D9 DISTILLATE! NO CUTS. NO PG. NO VG. NO VITAMIN E. CAT3 LAB TESTED. NO GMO. SOLVENT FREE.\n\n"
+            "Natural terps. Best vapes on the market.\n\n"
+            "Flavours:\n\n"
+            "Route 65\nGridlock\nOrange magic\nBlack magic\nLimelight\n"
+            "Wizard fuel\nCorked\nWizard trees\nGalactic rainbow\nJungle juice"
+        ),
+        "tiers": [(1, 29.00), (2, 27.00), (5, 25.00), (5, 26.00), (10, 23.00), (25, 21.00), (50, 20.00), (100, 18.00), (200, 16.00)],
+    },
+    # ── Hash ──────────────────────────────────────────────────────────────────
+    "🍋 Lemon Sherbet Squidgy Black Hash 🌿": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 5.0, "reviews": 1,
+        "unit": "gr", "step": 3.5,
+        "desc": "Squidgy black hash strain : Lemon Sherbet\n\nSticky and sweet, a great every day smoke.",
+        "tiers": [(3.5, 7.42), (7.0, 5.80), (14.0, 5.00), (28.0, 3.95), (56.0, 3.40), (100.0, 2.95), (200.0, 2.60), (500.0, 2.40)],
+    },
+    "🌅 Durban Poison Squidgy Black Hash 🐍": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.6, "reviews": 34,
+        "unit": "gr", "step": 3.5,
+        "desc": (
+            "Durban Poison is a premium variant of traditional Squidgy Black Hash, a classic cannabis "
+            "concentrate originating from Afghan-style production methods.\n\n"
+            "This indica-dominant hash is crafted by allowing fresh indica plants to mature to an overripe "
+            "state, then hand-rubbing or pressing the resin glands (trichomes) to create a soft, pliable, "
+            "and oily texture—earning it the \"squidgy\" moniker for its malleable, sticky consistency that "
+            "doesnt crumble like drier hashes."
+        ),
+        "tiers": [(3.5, 7.42), (7.0, 5.80), (14.0, 5.00), (28.0, 3.95), (56.0, 3.40), (100.0, 2.95), (200.0, 2.70), (500.0, 2.40)],
+    },
+    "🌈 Fruity Pebbles Squidgy Black Hash 🌈": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.7, "reviews": 39,
+        "unit": "gr", "step": 3.5,
+        "desc": (
+            "Fruity Pebbles Squidgy Black Hash\n"
+            "Premium squidgy black hash infused with Fruity Pebbles terps. Soft, malleable texture with a deep black color.\n"
+            "Aroma/Flavor: Sweet tropical berries, citrus, fruity cereal vibes with classic earthy hash notes.\n"
+            "Effects: Euphoric, happy, creative head high that melts into deep relaxation. Potent and smooth.\n"
+            "Perfect for connoisseurs seeking flavorful, high-quality traditional hash."
+        ),
+        "tiers": [(3.5, 7.42), (7.0, 5.80), (14.0, 5.00), (28.0, 3.95), (56.0, 3.40), (100.0, 2.95), (200.0, 2.70), (500.0, 2.40)],
+    },
+    "🌿 Zushi Squidgy Black Hash 🌿": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 24,
+        "unit": "gr", "step": 3.5,
+        "desc": "Squidgy black hash strain : Zushi\n\ngood smoke",
+        "tiers": [(3.5, 7.42), (7.0, 5.80), (14.0, 5.00), (28.0, 3.95), (56.0, 3.40), (100.0, 2.95), (200.0, 2.70), (500.0, 2.40)],
+    },
+    "👻 Ghost Train Haze Blonde Hash 🚄": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.8, "reviews": 32,
+        "unit": "gr", "step": 3.5,
+        "desc": (
+            "Ghost Train Haze Blonde Hash\n"
+            "Premium blonde hash made from Ghost Train Haze. Light golden color, soft and pliable texture with excellent purity.\n"
+            "Aroma/Flavor: Loud diesel fuel, sharp citrus, pine, and sweet hazy fruit with classic hash earthiness.\n"
+            "Effects: Potent sativa-dominant high — energetic, uplifting, cerebral, and creative with a long-lasting euphoric buzz.\n"
+            "Top-shelf blonde hash for fans of strong, flavorful, heady smoke."
+        ),
+        "tiers": [(3.5, 7.42), (7.0, 5.80), (14.0, 5.00), (28.0, 3.95), (56.0, 3.40), (100.0, 2.95), (200.0, 2.60), (500.0, 2.40)],
+    },
+    "🍉 Watermelon Skittles Blonde Hash 🌿": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 26,
+        "unit": "gr", "step": 3.5,
+        "desc": "Blonde Hash strain : Watermelon Skittles\n\nGreat smoke for the price. Light and fruity.",
+        "tiers": [(3.5, 7.42), (7.0, 5.80), (14.0, 5.00), (28.0, 3.95), (56.0, 3.40), (100.0, 2.95), (200.0, 2.60), (500.0, 2.40)],
+    },
+    "🐸 Toad Venom Piatella Hash 🍓": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 62,
+        "unit": "gr", "step": 3.5,
+        "desc": (
+            "Premium Piatella hash from the Toad Venom strain. Rich, oily texture with earthy pine and subtle warm high, "
+            "balanced by sweet strawberry undertones. Heavy indica relaxation with a bright fruity finish.\n\n"
+            "Only 3.5g increments or what is listed"
+        ),
+        "tiers": [(3.5, 11.43), (7.0, 10.00), (14.0, 7.86), (28.0, 7.50), (56.0, 6.61), (100.0, 5.60), (200.0, 4.95), (500.0, 4.80)],
+    },
+    "🍬 Candy Rain Piatella Hash 🌧️": {
+        "cat": "Cannabis", "subcat": "Hash",
+        "stock": "Unlimited", "rating": 4.7, "reviews": 23,
+        "unit": "gr", "step": 3.5,
+        "desc": (
+            "Indulge in the sweet storm of Candy Rain Piatella Hash, a premium ice water hash crafted from the elite "
+            "Piatella extraction process. This top-shelf concentrate captures the essence of Candy Rain—a hybrid strain "
+            "born from London Pound Cake x Gelato, delivering a flavor explosion of sugary candy, creamy vanilla "
+            "undertones with candy hints\n\n"
+            "Only 3.5g increments or what is listed"
+        ),
+        "tiers": [(3.5, 10.57), (7.0, 9.14), (14.0, 7.29), (28.0, 7.11), (56.0, 6.25), (100.0, 5.30), (200.0, 4.75), (500.0, 4.55)],
+    },
+    # ── Extracts ──────────────────────────────────────────────────────────────
+    "🛢️ Rick Simpson Oil (RSO) 👍": {
+        "cat": "Cannabis", "subcat": "Extracts",
+        "stock": "Unlimited", "rating": 4.9, "reviews": 31,
+        "unit": "ml",
+        "desc": (
+            "RSO (Rick Simpson Oil) is a thick, dark cannabis extract known for its high THC content and "
+            "full-spectrum profile. It's typically consumed orally or applied topically.\n\n"
+            "Uses:\n"
+            "- Taken in small doses under the tongue, mixed into food, or swallowed directly.\n"
+            "- Can also be applied to the skin for localized relief.\n\n"
+            "Medicinal Benefits:\n"
+            "RSO is popular for its potential to help with epilepsy, chronic pain, inflammation, "
+            "insomnia, anxiety, and appetite loss."
+        ),
+        "tiers": [(1, 16.00), (5, 14.00), (10, 12.00), (25, 10.00), (50, 9.00), (100, 8.00)],
+    },
+}
+
+def get_tier_price(product_name, qty):
+    tiers = PRODUCT_DETAILS.get(product_name, {}).get("tiers", [(1, 0)])
+    price = tiers[0][1]
+    for min_qty, tier_price in sorted(tiers):
+        if qty >= min_qty:
+            price = tier_price
+    return price
+
+def product_content(product_name, chat_id=None):
+    d = PRODUCT_DETAILS.get(product_name, {})
+    qty  = user_product_state.get(chat_id, {}).get("qty", 1.0) if chat_id else 1.0
+    cat  = d.get("cat", "")
+    sub  = d.get("subcat", "")
+    price       = get_tier_price(product_name, qty)
+    cart_total  = get_cart_total(chat_id) if chat_id else 0.0
+    reviews     = d.get("reviews", 0)
+
+    unit = d.get("unit", "pcs")
+    step = d.get("step", 1.0)
+    tiers_text = "\n".join(
+        f"<code>from {mn:>6.2f} {unit} @ £{pr:.2f}</code>"
+        for mn, pr in sorted(d.get("tiers", []))
+    )
+
+    path = f"{cat} → {sub}" if sub else cat
+    text = (
+        f"<b>{product_name}</b>\n"
+        f"{path} • Stock {d.get('stock','Unlimited')} • ★ {d.get('rating',0)} ({reviews})\n\n"
+        f"{d.get('desc','')}\n\n"
+        f"{tiers_text}"
+    )
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Enter Quantity Manually", callback_data="qty_manual"))
+    kb.row(
+        types.InlineKeyboardButton(f"▲ +{step:.2f}",      callback_data="qty_plus"),
+        types.InlineKeyboardButton(f"🛒 £{cart_total:.2f}", callback_data="cart_view"),
+        types.InlineKeyboardButton(f"▼ -{step:.2f}",      callback_data="qty_minus"),
+    )
+    kb.add(types.InlineKeyboardButton(
+        f"Add to Cart : {qty:.2f} {unit} [£{price:.2f}]",
+        callback_data="add_to_cart",
+        pay=True
+    ))
+    kb.row(
+        types.InlineKeyboardButton("Add to Wishlist", callback_data="add_wishlist"),
+        types.InlineKeyboardButton(f"{reviews} reviews for thi...", callback_data="prod_reviews"),
+    )
+    back_cb = f"subcat_{cat}|{sub}" if sub else f"cat_{cat}"
+    kb.add(types.InlineKeyboardButton("Back", callback_data=back_cb))
+    return text, kb
+
+CATEGORIES = [
+    ("Benzos",          2),
+    ("Cannabis",        20),
+    ("Dissociatives",   7),
+    ("Ecstasy",         3),
+    ("Opiates",         1),
+    ("Stimulants",      5),
+    ("Psychedelic",     10),
+    ("🍋 Quaaludes 🍋", 1),
+    ("Sleep / Anxiety", 1),
+]
+
+SUBCATEGORIES = {
+    "Benzos":          [("Pills", 2)],
+    "Cannabis":        [("Sweet Edibles", 10), ("Extracts", 1), ("Hash", 8), ("Vapes", 1)],
+    "Dissociatives":   [("Ketamine", 4), ("🍕 Quattro Forketti Bundle", 2), ("GBL", 1)],
+    "Ecstasy":         [("MDMA", 1), ("Pills", 2)],
+    "Opiates":         [("Codeine", 1)],
+    "Stimulants":      [("Methamphetamine", 3), ("Cocaine", 2)],
+    "Psychedelic":     [("LSD", 2), ("2C-B", 3), ("Mushrooms", 5)],
+    "🍋 Quaaludes 🍋": [("Pills", 1)],
+    "Sleep / Anxiety": [("Pills", 1)],
+}
+
+# Products: {category: {subcategory: [(name, price_gbp)]}}
+PRODUCTS = {
+    "Benzos": {
+        "Pills": [
+            ("Alprazolam Xanax Alxan 1mg", 0),
+            ("Diazepam Valium 10mg (Martin Dows)", 0),
+        ],
+    },
+    "Cannabis": {
+        "Sweet Edibles": [
+            ("🍬 500mg RELAX Edibles - Cherry 🍒", 0),
+            ("🍬 500mg RELAX Edibles - Cola Bottles 🥤", 0),
+            ("🍬 500mg RELAX Edibles - Pina Colada 🍹", 0),
+            ("🍬 500mg RELAX Edibles - Pineapple 🍍", 0),
+            ("🍬 500mg RELAX Edibles - Apple 🍎🍏", 0),
+            ("🍬 500mg RELAX Edibles - Strawberry 🍓", 0),
+            ("🍬 500mg RELAX Edibles - Orange & Lemon 🍊🍋", 0),
+            ("🍬 500mg RELAX Edibles - Mixed Berries 🫐🍒", 0),
+            ("🍬 500mg RELAX Edibles - Watermelon 🍉", 0),
+            ("🍬 500mg RELAX Edibles - Blue Raspberry 🔷", 0),
+        ],
+        "Extracts": [("🛢️ Rick Simpson Oil (RSO) 👍", 0)],
+        "Hash": [
+            ("🍋 Lemon Sherbet Squidgy Black Hash 🌿", 0),
+            ("🌅 Durban Poison Squidgy Black Hash 🐍", 0),
+            ("🌈 Fruity Pebbles Squidgy Black Hash 🌈", 0),
+            ("🌿 Zushi Squidgy Black Hash 🌿", 0),
+            ("👻 Ghost Train Haze Blonde Hash 🚄", 0),
+            ("🍉 Watermelon Skittles Blonde Hash 🌿", 0),
+            ("🐸 Toad Venom Piatella Hash 🍓", 0),
+            ("🍬 Candy Rain Piatella Hash 🌧️", 0),
+        ],
+        "Vapes": [("🌿 1ml Wizard Trees - Sleeve Cali Vapes - 10 strains ⚡", 0)],
+    },
+    "Dissociatives": {
+        "Ketamine": [
+            ("🟥 Red Label Long shard Needles (S-Isomer)", 0),
+            ("🌌 Astral Ketamine Sand", 0),
+            ("💎 Diamond Rock Ketamine (New Synth)", 0),
+            ("🙏 Buddha Ketamine Needles (S-Isomer)", 0),
+        ],
+        "🍕 Quattro Forketti Bundle": [("4x3.5g Bundle (30% OFF)", 0), ("4x1g Bundle (40% OFF)", 0)],
+        "GBL":                     [("99.9% GBL - Liquid XTC (Up to 25L) 💧 ✨", 0)],
+    },
+    "Ecstasy": {
+        "MDMA":  [("💙 Euphoric Dutch Champagne MDMA 91% 💙", 0)],
+        "Pills": [("⏱️ Tesla 300mg XTC ⏱️", 0), ("🟣 Purple Punisher 300mg XTC 🟣", 0)],
+    },
+    "Opiates": {
+        "Codeine": [("Codeine Phosphate Teva 30mg", 0)],
+    },
+    "Stimulants": {
+        "Methamphetamine": [
+            ("💎 🇳🇱 Clandestine Dutch Ephedrine Meth 🇳🇱 💎", 0),
+            ("💎 🇨🇳 Hong Kong Premium Triads Meth (D-Isomer) 🇨🇳 💎", 0),
+            ("💎 🇮🇷 Iranian Superlab Meth Batch #2 (D-Isomer) 🇮🇷 💎", 0),
+        ],
+        "Cocaine":         [("🇧🇴 Bolivian Cream Cocaine P500 #1 🔥", 0), ("🇨🇴 Colombian Power Coke - LACOSTE #1 🇨🇴", 0)],
+    },
+    "Psychedelic": {
+        "LSD":       [("🌈 Dr Seuss - DS3 XTAL - 200ug LSD 🌈", 0), ("🌈 100ug Dr Suess Acid (LSD) 🌈", 0)],
+        "2C-B":      [("💧 2C-B Drops - 125mg 🐝 Candy Flavour 🍭", 0), ("🐝 Pure 2C-B Powder - HCL 🐝", 0), ("🐝 22mg 2C-B Bumble Bees 💊", 0)],
+        "Mushrooms": [
+            ("💧 Shroom Drops 🍄 Vanilla Flavour 🌈", 0),
+            ("🍄 Machine Elf Whole Mushrooms 🍄", 0),
+            ("🍄 Tidal Wave #4 Whole Mushrooms 🍄", 0),
+            ("🍄 Albino Hillbilly Pumpkin Whole Mushrooms 🍄", 0),
+            ("🍄 Albino Penis Envy Whole Mushrooms 🍄", 0),
+        ],
+    },
+    "🍋 Quaaludes 🍋": {
+        "Pills": [("🍋 Quaaludes - Lemmon 714 🍋", 0)],
+    },
+    "Sleep / Anxiety": {
+        "Pills": [("Zopiclone HAB 7.5mg", 0)],
+    },
+}
+
+def listings_content(chat_id=None):
+    cart_total = get_cart_total(chat_id) if chat_id else 0.0
+    text = "Select a product category to fill your shopping basket"
+    kb = types.InlineKeyboardMarkup()
+    for name, count in CATEGORIES:
+        kb.add(types.InlineKeyboardButton(f"{name} ({count})", callback_data=f"cat_{name}"))
+    kb.row(
+        types.InlineKeyboardButton("Back", callback_data="main_back"),
+        types.InlineKeyboardButton("Price List", callback_data="price_list"),
+        types.InlineKeyboardButton(f"🛒 £{cart_total:.2f}", callback_data="cart"),
+    )
+    return text, kb
+
+def category_content(category_name, chat_id=None):
+    cart_total = get_cart_total(chat_id) if chat_id else 0.0
+    text = f"Category: <b>{category_name}</b>"
+    kb = types.InlineKeyboardMarkup()
+    for subcat, count in SUBCATEGORIES.get(category_name, []):
+        kb.add(types.InlineKeyboardButton(f"{subcat} ({count})", callback_data=f"subcat_{category_name}|{subcat}"))
+    kb.row(
+        types.InlineKeyboardButton("Back", callback_data="listings"),
+        types.InlineKeyboardButton(f"🛒 £{cart_total:.2f}", callback_data="cart"),
+    )
+    return text, kb
+
+def subcategory_content(category_name, subcat_name, chat_id=None):
+    cart_total = get_cart_total(chat_id) if chat_id else 0.0
+    text = f"Category: <b>{category_name} → {subcat_name}</b>"
+    kb = types.InlineKeyboardMarkup()
+    products = PRODUCTS.get(category_name, {}).get(subcat_name, [])
+    for idx, (product_name, _) in enumerate(products):
+        cb = f"prod_{category_name}|{subcat_name}|{product_name}"
+        if len(cb.encode("utf-8")) > 64:
+            cb = f"prodi_{category_name}|{subcat_name}|{idx}"
+        kb.add(types.InlineKeyboardButton(product_name, callback_data=cb))
+    kb.row(
+        types.InlineKeyboardButton("Back", callback_data=f"cat_{category_name}"),
+        types.InlineKeyboardButton(f"🛒 £{cart_total:.2f}", callback_data="cart"),
+    )
+    return text, kb
+
+# ── Main menu ──────────────────────────────────────────────────────────────────
+
+FAQ_ANSWERS = {
+    "faq_no_package": (
+        "<b>I havent received my package. Whats going on?</b>\n\n"
+        "Hi there,\n\n"
+        "If you have ordered untracked I cannot help you with any tracking requests.\n\n"
+        "If you have ordered tracked24/SD and have not received after 3 days, please feel free to message (ENCRYPTED!) with your post code, name, and order and I will provide a tracking number for you.\n\n"
+        "Tracked 24 is not actually a guaranteed 24 hour service which is a bit misleading.\n\n"
+        "All parcels will turn up eventually, do not fret, Royal Mail can be unpredictable.\n\n"
+        "Sit tight and enjoy your products when they land.\n\n"
+        "OL"
+    ),
+    "faq_trackbot": (
+        "<b>📌 Trackbot Info! 📌</b>\n\n"
+        "The answer is yes!\n\n"
+        "However,\n\n"
+        "It is only available after 3 days from being marked dispatched via our trackbot, which can be found WHEN YOU START UP THE BOT. Main page.\n\n"
+        "⚠️ Tracking is available same day on only very large orders. >£2k.\n\n"
+        "Request tracking ONLY if a package has not landed in the expected time-frame.\n\n"
+        "⚠️ Speed things up: Send Inv No, Despatch Date, Post Code.\n\n"
+        "Thanks to all of you for using us and please follow the above to help us to continue offering the efficient service were known for.\n\n"
+        "OL"
+    ),
+    "faq_opening": (
+        "<b>What are your opening times?</b>\n\n"
+        "We are open Monday to Friday, orders shipped for same day delivery till midday.\n\n"
+        "Guaranteed same day shipping cutoff is 12, but we often ship orders submitted up until 2PM.\n\n"
+        "Orders or messages received outside of these times will be processed the next WORKING day.\n\n"
+        "OL 🇬🇧"
+    ),
+    "faq_payment": (
+        "<b>I have underpaid/overpaid my order. What do I do?</b>\n\n"
+        "Please just send us the following:\n\n"
+        "1) Your Blockchain TXID. They look like this:\n\n"
+        "BTC TXID:\n5dcca7c2c53e6e2d7a9b4c7f4c1b7a4a3d3c9a9a5b0f6d1e1b7a5c3f7b6d2c1\n\n"
+        "LTC TXID:\n8f0e0f1b8dd5f2d8b9e6a5c1d2f7b4c3a9d1c6e2f3b8a7c4d5e2f1b0c9a4d2\n\n"
+        "XMR TXID:\n6e3a9b8d7c5e2f1b4d8a7c2b1d3f6a5c9e1d2f3a4b5c6d7e8f9a0b1c2d3e4f5\n\n"
+        "2) Amount sent.\n\n"
+        "3) Invoice Number.\n\n"
+        "OL 🇬🇧"
+    ),
+    "faq_group_chat": (
+        "<b>Do you have a group chat?</b>\n\n"
+        "ℹ️ Answer coming soon."
+    ),
+    "faq_tips": (
+        "<b>Tips for Ordering: Sending Correct Amount and...</b>\n\n"
+        "ℹ️ Answer coming soon."
+    ),
+    "faq_arrival": (
+        "<b>When will my package arrive?</b>\n\n"
+        "🕐 Delivery times for your order vary depending on Royal Mail performance..\n\n"
+        "Once your order is marked as dispatched:\n\n"
+        "📌 Track24 and: Usually arrives within 1-3 business days but may take 5 business days or more.\n\n"
+        "✏️ Please note that these time-frames are approximate and are reliant on Royal Mail procedures, local depot performance and other variables out of OpenLines control.\n\n"
+        "What do OpenLine Guarantee?\n\n"
+        "We guarantee our customers that if your order is marked as Dispatched, then the order has indeed been sent out that day.\n\n"
+        "We have a very efficient and battle tested dispatch system that weve perfected over years and we can easily trace and correct those rare errors made at our end."
+    ),
+    "faq_cancelled": (
+        "<b>My order has been cancelled</b>\n\n"
+        "Occasionally, orders appear cancelled when there is an incorrect amount of BTC, LTC or XMR sent. Your funds are safe!\n\n"
+        "• Please contact our bot through the \"Contact\" option.\n\n"
+        "• In your message, kindly include your order ID and TXiD.\n\n"
+        "• This will assist us in promptly investigating the issue and proceeding with your purchase without any delays.\n\n"
+        "To prevent this happening again it is best to send crypto from YOUR OWN wallet and not an exchange. This way any transaction fees are taken from your remaining wallet balance and we receive the exact amount."
+    ),
+    "faq_aus": (
+        "<b>Australian Shipping T&Cs</b>\n\n"
+        "Despite the obvious difficulties in successfully landing packages in Australia, our trials have proven to have a high success rate. As such, we currently offer a 25% refund or a 50% refund for lost or seized packages.\n\n"
+        "Shipping times from UK to AUS vary from 1-4 weeks due to factors beyond our control. So please be patient.\n\n"
+        "We change our stealth methods regularly and have multiple methods for different weights/products. Larger amounts may be received in one or two packages.\n\n"
+        "Tracking will be provided after 3 weeks if your package hasn't arrived.\n\n"
+        "We will be posting 3-4 days per week only. This gives your packages the best chance of successfully making it into your hands.\n\n"
+        "If your package is seized and you want a reship we will NOT be able to reship to the same address as that address may now be flagged.\n"
+        "So in this case you will need to provide a new name and address or opt for a 25% refund."
+    ),
+}
+
+PGP_KEY = """-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBFqeuj0BEAC1BJRGHKWCpT73wdKYZ+BVNAsaT3k85HqbvtkqvLNIO9qPmMm4
+Omx8nXl9aCKVRRA/gJRqSSe2chkIrICjEXwj595reVqvamAV+KnQ0mFdnPzPmmVP
+1slsir0FXYzXDEYGZwvsGu54e86JCCOTQ029v+lyVpvaCHCYVz41AeoUsoroptPo
+M70dLaSfomVZVbqCTmnlvdQ+rPH2tAPbPxsVKVGe02kuT11GC2THQyvwjG6+7UIi
+uf387PxHe7WuhseT/WZoGY3qerRJSuhw2/h7UTCvbdA1dW7pHp4eVkZSe2GvIzK6
+S0G0XKKeZ3DdPO4BWSClFg7lzQnsxEcVg8apDnNeV2uJtN9mtNEQvzwdISc46RkL
+51d5feRP7txkfcuJbEXIxV6T/134VQ4jKg2sQyboCUGxKz6vKz8SsORGjseAmoDu
+iYPzC7oKj50BkzWfm+hKfPhpLZOdTvVHZn/2x6Lz6k+iQphUPFALJPYr2ncJk8Kc
+R1Xj7LIzEHVaXi+6oAQO8UrDQRFsaOsJ3tYI5ulji+YhsXh7XOmoPOJgIuV7cCIN
+BBjCyRA50O08D2t7J2wKhTzdNCXVadBXv76PT7KMxKzDYxS4I7jMaGbLNQa68ZAg
+S6qBLz99ggh+Ya3BwsvuVrSJTOxepw8Pyy7qHwpcH/4Vha9z4wrt4S9t5wARAQAB
+tAZQT1BFWUWJAk4EEwEKADgWIQRseG/KEPhUXSIzfhkgMne1POGH1QUCWp66PQIb
+AwULCQgHAwUVCgkICwUWAgMBAAIeAQIXgAAKCRAgMne1POGH1f/2D/96XNKQQDeL
+NTgTommuXRi1Rrq1g5c/LPCyzpPa7/B8GsSEJmMAJ1I8ntKc+GO0cHjXNej7VqdN
+o/m0M9HKDbjgiEJnrSBNPcYALFKXOA2BRKZCk1CNJv/1wMDSVLqDeik/unBCqBtb
+JVLkH9rEBJrKntX2kiaoqKtLxPCkJVeEF0+FVXDuDPTVPBvwDKKZObNfawqGqTID
+M+VAZQvXn5O1DerRVQfMH6UjlmZOU3H+hhak93UZcmSO+/pFMniiEuayCV30n1RN
+Ydmk18wTHQVDsz5iSRirLVWKavxBlnAFGl4m295I8z2fH8dxP2jdbs247e2unhvv
+U3hG1sdVuZ2wELjSxKKQrI96fABDufbwH3rISw8IIpshi8Ng2GTbI2KDa40AC3+z
+NzoSjZmvcktzfrgvCEAqrWgGjEezJul9SNgoBc9UcDhsGFpgaBWEkmxyJNoLKPYS
+U6rq4djJUH3USh/pvNKP8VAKSC0wrLbIbWoASBT2C4welXPxmovSFG45V9/QgCD6
+XValPs3jtM8PCUQh1UVdJhrQ8xmcZG6OPLK3RG7f87g6O4x6HxTSMupQ2Ond1+am
+AP3TvQr2rsoyMyD32AxKAZ103+LwLaVsf1j6ykClJ5/KJnaYZI7J4atl2CjaC2hf
+OgTkJW5WtETvDNb9OItR9a5Ee+K33lYuEokBHAQQAQgABgUCW3ME4QAKCRCo18rL
+cT8WPxXuCADEP6O0hLMqpXGRYkHHY71NzgYrB86h+7PIudKineTEc3RCUSse4naA
+l5K/Ms708lZ+TWrZ/LLxniInymBvNPo57ou1RQT1IL/J08o8eIsHDelSLRz2e19B
+1dCYmN8dw257z9frPgfj+zgf56KqtpvedeaDG3Ll79xihxc1iGPCROJzp+9xKRh2
+dP8XHYSgbIt/FjCaFHtKlRB23vfb0LWXUWbSbbtFt9DqFEgfT4hTCGGAAFIAPXP3
+yDMs6q4pV4Ghj6S2x7NkOFuuqQ1Hg7+qQjSL2CSMK38KcjVvaqmcl69Z7id8nS11
+T9HkDpmmgI8CissIkQBeeOnpnL6+bAp3iQEzBBABCAAdFiEEYgBoadjpB91fS/A4
+Xs+9A/xlebwFAlsYUWMACgkQXs+9A/xlebz9Ggf/WWrVCj9zg8bSJU2ZAmM0bQ8c
+oXANe/MuP8IPB34QUbk3yIPd/BeyzCKUx8/K2x60h+hJL6cvsJGwRP67UKV4c//5
+5Y8gxGRMvGkniSozfdqSW9KYLZm3vxVH9EZkruvmNko4bUFS4zjUX5Shez0ajKbZ
+MJ5XIppn+FhB1Ufl19y93nP7EDUc0MYmFBOSdEF/7u2voWzdcVzGraGykn0PVmTS
+df/WRT6fEt3PkydQWyj7ds34QAb7S/fEU38kRV9pKp0W2SfHsE0uN3wZp/uyvb1A
+nqMdLh6BBeC7MNT1I+KtFKHvVKYSAweXyDmHvmNx5YcRxBnufFIfxJNDpdhTPLkC
+DQRanro9ARAAzLPBvnPQ50kjN86e6YPe6M/0spWpT32N+nH9eMTxw70nOT471/EV
+m7kz0/uimpbBSVL8SI6Fr5bwdm/Ryb3acZiEjq+l8Ln5mBbAlbphWeJ9+5kznGXI
+kUI7Qsf72RlkiPHB0oYttJ8uOVL/+FbnfkyIruHbFnkVDFC5HBBWw6He4DevBmOS
+3yWhnOZA20mJFn8x5tFQRPj2d9QIU4HlNUPSaHLbwlC3tlQt04n80plq5429y4Od
+eTLAKqw2NkSKp8fyzMH/Nl5nnDrnNfB1vHXEg7hZew2KhKADngU33lLWadKAZJVU
+SoH/t38MNHidRdVDe2JpPPzLP9Z20Wo+1Ye5lARj9xrKoxWt3k1EqFoQo5AfmmuB
+mYmGD7uz+fli6mrJAcCGQzTRsn1sgX1rRcXOwV62v2zxqDnRPVeZ0bL6H2gqv75K
+/BvJznxCs4rkwjW27Z6VNELsNQoRQwjYHYz3LW0RGyXa5EUcWKIdEcCiDwFRIuhy
+7LyPnmw1VQPNGpwHJ6e4fxl1WpYJyvq5N+d76PIDgR3ObkbFWV6ueeHmPM04PqE8
+XagrmSjWnf5oRIvkW4/5eXUFjgXH+mIU1s6m6uoI/PFLqO0v3RdAFA5g3pzfd1o5
+ehPdK2h87dKFpsj2nmMyRHzhed57s/D1VKWthC32vNVVnOnYIeYUXY8AEQEAAYkC
+NgQYAQoAIBYhBGx4b8oQ+FRdIjN+GSAyd7U84YfVBQJanro9AhsMAAoJECAyd7U8
+4YfVXZwP/jSrRCSI//n8JGJW90tsuj8RuxxrRT+iFykg2XF0HGDS18vJvuUIwLqG
+fohhGHiktu2cIU2fiqysXOhimN6xH+QnicTfsjl3OCx9B/9rrzZAs79Ngp0aScsC
+xdb3iz9E0vbHu11D5fLInKAlt2yh0S/hp2l1KUuARY2TnbAWAgyU1bExnQcnpuPu
+eOmmjA2p6PWXM8sUztPwbdU6EKLixFnLw8c3sicYuBjfNaSh+/55vCZkKsQ1I8or
+5i006N+NEezWzrXUvv3H2XSuTEMTRKqywupOAD4/hL6TPS9p8gL6ZoHWwir2gZ4b
+QI57DvSkBDk/XegYtxaKRO9IS9ICovj97G1CCYMh9tBMCQuY1ITQ/xfkPP7HwtCB
+k3cnl7q/3tcO7tA4n2aehLr9i9A7oFWsaw/xamDol6TVXc/1IwXQxjOjqrKHAGsn
+SOeTU5K+yxflPPSs6ZKPihhqm+mF1Yt1Oe+WCiksmQMoFiHMKGHuv9jn3UBqM5GO
+vcDqaTqdNekCCerj3EDxYn3HnOP6LeNg77gticNdOY72KLSDpj8EixNgKFTOemTk
+pW9DS9tQ2qxuDpgRcs+OKLE2DzsL0bFz3+7zHoq7JZ2S7KQeJXdWg1lAmYCNTZp0
+HeaWKlhhuicHqNul/QHQzYUakEAimgZd1mwmWSS4WjVf4r5impE7
+=RExN
+-----END PGP PUBLIC KEY BLOCK-----"""
+
+def pgp_content():
+    text = f"🔑 <b>PGP Public Key</b>\n\n<code>{PGP_KEY}</code>"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Back to Main Menu", callback_data="main_back"))
+    return text, kb
+
+def tos_content():
+    text = (
+        "<b>Terms of Service</b>\n\n"
+        "YOU MUST RECORD OPENING YOUR PACKAGES TO HELP WITH ANY DISPUTE!!\n\n"
+        "This means OPENING from the OUTSIDE of the package.\n\n"
+        "If youve already opened it, then record, it is obviously void.\n\n"
+        "We are MUCH less likely to offer any resolution if you dont do this.\n\n"
+        "⚠️ THE BOT CANNOT RECEIVE VIDEOS/IMAGES - IT WILL NOT EVEN SEND A MESSAGE TO US. "
+        "You must message first asking where to send the video. ⚠️"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Back to Main Menu", callback_data="main_back"))
+    return text, kb
+
+MIDWEEK_PAGES = {
+    1: (
+        "‼️ MIDWEEK MADNESS ‼️ 24 HRS.. ⏰\n\n"
+        "INSANE DEALS.\n\n"
+        "ALL THE WAY TILL WEDNESDAY MIDNIGHT.\n\n"
+        "DONT MISS OUT."
+    ),
+}
+
+def midweek_content(page=1):
+    total = len(MIDWEEK_PAGES)
+    text = MIDWEEK_PAGES.get(page, MIDWEEK_PAGES[1])
+    kb = types.InlineKeyboardMarkup()
+    nav = []
+    for p in range(1, total + 1):
+        label = f"{p}*" if p == page else (f"{p} »" if p == total else str(p))
+        nav.append(types.InlineKeyboardButton(label, callback_data=f"midweek_{p}"))
+    kb.row(*nav)
+    kb.add(types.InlineKeyboardButton("Back to Main menu", callback_data="main_back"))
+    return text, kb
+
+def price_list_content():
+    lines = []
+    for cat_name, _ in CATEGORIES:
+        subcats = PRODUCTS.get(cat_name, {})
+        for subcat_name, product_list in subcats.items():
+            for product_name, _ in product_list:
+                d = PRODUCT_DETAILS.get(product_name, {})
+                tiers = d.get("tiers", [])
+                if tiers:
+                    start_qty, start_price = tiers[0]
+                    unit = d.get("unit", "pcs")
+                    lines.append(f"• <b>{product_name}</b>\n  from £{start_price:.2f}/{unit}")
+    text = "📋 <b>Price List</b>\n\n" + "\n\n".join(lines) if lines else "📋 <b>Price List</b>\n\nNo products found."
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("← Back", callback_data="listings"))
+    return text, kb
+
+def price_drop_content():
+    text = (
+        "⬇️ <b>HUGE Cocaine Price Drop!</b> ⬇️\n\n"
+        "⬇️❄️ COKE PRICE REDUCTION! ⬇️❄️\n\n"
+        "HEAVIER WEIGHTS ADDED. 🚛\n\n\n"
+        "3.5g = £129\n"
+        "28g = £825\n\n"
+        "1000g = £23500"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(
+        "💙 Euphoric Dutch Champagne MDMA 91% 💙",
+        callback_data="prodi_Ecstasy|MDMA|0"))
+    kb.add(types.InlineKeyboardButton(
+        "🇧🇴 Bolivian Cream Cocaine P500 #1 🔥",
+        callback_data="prodi_Stimulants|Cocaine|0"))
+    kb.add(types.InlineKeyboardButton(
+        "🇨🇴 Colombian Power Coke - LACOSTE #1 🇨🇴",
+        callback_data="prodi_Stimulants|Cocaine|1"))
+    kb.add(types.InlineKeyboardButton("Back to Main menu", callback_data="main_back"))
+    return text, kb
+
+def my_cafe_content():
+    text = (
+        "🌐 ☕ <b>My cafe!</b> ☕ 🌐\n\n"
+        "Introducing...\n\n"
+        "☕ OPENLINES CAFE!!! ☕\n"
+        "https://openline.cafe/\n\n"
+        "Save this link and you will ALWAYS be up to date with our current bot, signal group, matrix and telegram chats!\n\n"
+        "Perfect if you dont want to chat with all of us -\n\n"
+        "1) Bookmark\n"
+        "2) When you want to order, visit openline.cafe\n"
+        "3) Click shop or go to openline.cafe/shop\n\n"
+        "Signal link: https://signal.group/#CjQKIJXF9N8jQNtIOzQlKtADPe94Kgk5q5i3PCb8Vs-JZH80EhCNkgMQOflQfQjy9W3ESMCX\n\n"
+        "Tele contact: @jimmy_james40\n\n"
+        "Done!"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Back to Main menu", callback_data="main_back"))
+    return text, kb
+
+def faq_content():
+    text = "Select your question to see the answer"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("I havent received my package. Whats going on?", callback_data="faq_no_package"))
+    kb.add(types.InlineKeyboardButton("📌 Trackbot Info! 📌", callback_data="faq_trackbot"))
+    kb.add(types.InlineKeyboardButton("What are your opening times?", callback_data="faq_opening"))
+    kb.add(types.InlineKeyboardButton("I have underpaid/overpaid my order. What do I d...", callback_data="faq_payment"))
+    kb.add(types.InlineKeyboardButton("Do you have a group chat?", callback_data="faq_group_chat"))
+    kb.add(types.InlineKeyboardButton("Tips for Ordering: Sending Correct Amount and...", callback_data="faq_tips"))
+    kb.add(types.InlineKeyboardButton("When will my package arrive?", callback_data="faq_arrival"))
+    kb.add(types.InlineKeyboardButton("My order has been cancelled", callback_data="faq_cancelled"))
+    kb.add(types.InlineKeyboardButton("Australian Shipping T&Cs", callback_data="faq_aus"))
+    kb.add(types.InlineKeyboardButton("Back to Main Menu", callback_data="main_back"))
+    return text, kb
+
+def cart_content(chat_id):
+    cart = user_cart.get(chat_id, [])
+    total = get_cart_total(chat_id)
+    kb = types.InlineKeyboardMarkup()
+    if not cart:
+        kb.add(types.InlineKeyboardButton("🚀 Shop", callback_data="listings"))
+        kb.add(types.InlineKeyboardButton("Menu", callback_data="main_back"))
+        return "🛒 <b>Your Cart</b>\n\nYour cart is empty.", kb
+    text = "This is a list of all the items in your basket. If you want to remove any of them, select the name of the item from the list.\n\n"
+    for i, item in enumerate(cart):
+        text += f"{i+1}. <b>{item['name']}</b> {item['qty']:.2f} {item['unit']} — £{item['line_total']:.2f}\n"
+    text += f"\nTotal: <b>£{total:.2f}</b>"
+    for i, item in enumerate(cart):
+        kb.add(types.InlineKeyboardButton(
+            f"{item['name']} {item['qty']:.2f} {item['unit']}...",
+            callback_data=f"remove_cart_{i}"
+        ))
+    kb.add(types.InlineKeyboardButton("Checkout", callback_data="checkout"))
+    kb.add(types.InlineKeyboardButton("Menu", callback_data="main_back"))
+    return text, kb
+
+def payment_method_content():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Litecoin",      callback_data="pay_method_Litecoin"))
+    kb.add(types.InlineKeyboardButton("Bitcoin",       callback_data="pay_method_Bitcoin"))
+    kb.add(types.InlineKeyboardButton("Monero",        callback_data="pay_method_Monero"))
+    kb.add(types.InlineKeyboardButton("Back to Order", callback_data="checkout"))
+    return "Choose an available payment method", kb
+
+def checkout_content(chat_id):
+    cart = user_cart.get(chat_id, [])
+    if not cart:
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🚀 Shop", callback_data="listings"))
+        return "🛒 Your cart is empty.", kb
+    subtotal = get_cart_total(chat_id)
+    discount_pct  = user_discount.get(chat_id, 0.0)
+    discount_code = user_discount_code.get(chat_id, "")
+    delivery_method = user_delivery.get(chat_id)
+    delivery_fee = get_delivery_fee(delivery_method)
+    total = round(subtotal + delivery_fee, 2)
+    method  = user_payment_method.get(chat_id)
+    address = user_address.get(chat_id)
+    invoice_num = f"{(chat_id * 7 % 9000000) + 1000000}"
+    text = f"🗂 <b>Invoice {invoice_num}</b>\n\n"
+    text += "Status: 🕐 Pending Checkout\n\n"
+    text += "Enter the discount code, payment method, address and delivery method. Once your order has been completed, you will be given payment the details\n\n"
+    for i, item in enumerate(cart):
+        text += f"{i+1}. <b>{item['name']}</b>\n{item['qty']:.2f} — £{item['line_total']:.2f}\n"
+    if discount_pct and discount_code:
+        text += f"\nDiscount: {discount_code} - {discount_pct:.1f}%"
+    if delivery_method:
+        text += f"\nDelivery: {delivery_method}"
+    text += f"\nTotal: <b>£{total:.2f}</b>"
+    kb = types.InlineKeyboardMarkup()
+    if discount_pct and discount_code:
+        kb.add(types.InlineKeyboardButton(
+            f"✅ {discount_code} ({discount_pct:.1f}%)", callback_data="checkout_discount"))
+    else:
+        kb.add(types.InlineKeyboardButton("Enter a discount code", callback_data="checkout_discount"))
+    if method:
+        kb.add(types.InlineKeyboardButton(f"✅ Payment Method: {method}", callback_data="checkout_payment"))
+    else:
+        kb.add(types.InlineKeyboardButton("Select Payment Method", callback_data="checkout_payment"))
+    if address:
+        kb.add(types.InlineKeyboardButton("✅ Change Delivery Address", callback_data="checkout_address"))
+    else:
+        kb.add(types.InlineKeyboardButton("Enter Delivery Address", callback_data="checkout_address"))
+    if delivery_method:
+        kb.add(types.InlineKeyboardButton("✅ Change Delivery Method", callback_data="checkout_delivery"))
+    else:
+        kb.add(types.InlineKeyboardButton("Select Delivery Method", callback_data="checkout_delivery"))
+    if method and address and delivery_method:
+        kb.add(types.InlineKeyboardButton("Checkout", callback_data="checkout_tos"))
+    kb.row(
+        types.InlineKeyboardButton("Delete Order", callback_data="clear_cart"),
+        types.InlineKeyboardButton("Back",         callback_data="cart_main"),
+    )
+    return text, kb
+
+def delivery_method_content():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Tracked24 NoSign - £6.30",               callback_data="delivery_1st"))
+    kb.add(types.InlineKeyboardButton("Special Delivery 1PM Signed For - £11.00", callback_data="delivery_sd"))
+    kb.add(types.InlineKeyboardButton("Back to Order",                           callback_data="checkout"))
+    return "Please select a delivery method", kb
+
+def checkout_confirm_content(chat_id):
+    invoice_num = f"{(chat_id * 7 % 9000000) + 1000000}"
+    text = (
+        f"⚠️ <b>Confirmation of order creation {invoice_num}</b>\n\n"
+        "Before proceeding with the checkout, make sure you are well-informed about how to pay with "
+        "cryptocurrency. Ensure that you pay the <b>EXACT</b> crypto amount mentioned and not the "
+        "equivalent fiat amount. Be aware of any wallet fees that may be deducted during the "
+        "transaction process. It's crucial to follow these steps to ensure that your order will "
+        "not been cancelled."
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Yes, I understand", callback_data="i_understand"))
+    kb.add(types.InlineKeyboardButton("Back",              callback_data="checkout"))
+    return text, kb
+
+def payment_pending_content(chat_id):
+    cart = user_cart.get(chat_id, [])
+    subtotal = get_cart_total(chat_id)
+    discount_pct  = user_discount.get(chat_id, 0.0)
+    discount_code = user_discount_code.get(chat_id, "")
+    delivery_method = user_delivery.get(chat_id, "Tracked24 NoSign - £6.30")
+    delivery_fee = get_delivery_fee(delivery_method)
+    total = round(subtotal + delivery_fee, 2)
+    method  = user_payment_method.get(chat_id, "Litecoin")
+    wallet  = CRYPTO_ADDRESSES.get(method, "Address not configured")
+    symbol  = CRYPTO_SYMBOLS.get(method, "")
+    rate    = CRYPTO_RATES_GBP.get(method, 1.0)
+    crypto_amount = round(total / rate, 7)
+    invoice_num = f"{(chat_id * 7 % 9000000) + 1000000}"
+    text = (
+        f"🗂 <b>Invoice {invoice_num}</b>\n\n"
+        f"Status: 🕐 Pending Payment\n"
+        f"  ↳ time left <b>1h:59m</b>\n\n"
+        f"<b>Payment Address:</b>\n<code>{wallet}</code>\n"
+        f"<b>Amount</b>: <code>{crypto_amount:.7f} {symbol}</code>\n\n"
+        f"Please ensure that you send the <b>exact {symbol} amount</b> specified. "
+        f"It's important to note that certain exchanges or wallets may deduct fees from your payment, "
+        f"so kindly <b>double-check the amount before sending your payment</b> to make sure you sent the "
+        f"<b>correct amount</b>.\n\n"
+    )
+    for i, item in enumerate(cart):
+        text += f"{i+1}. <b>{item['name']}</b> {item['qty']:.2f} {item['unit']} — £{item['line_total']:.2f}\n"
+    if discount_pct and discount_code:
+        text += f"\nDiscount: {discount_code} - {discount_pct:.1f}%"
+    text += f"\nDelivery: {delivery_method}"
+    text += f"\nTotal: <b>£{total:.2f}</b>"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("QR Code",   callback_data="qr_code"))
+    kb.add(types.InlineKeyboardButton("Add Notes", callback_data="add_notes"))
+    kb.add(types.InlineKeyboardButton("Refresh",   callback_data="refresh_pending"))
+    kb.add(types.InlineKeyboardButton("Back",      callback_data="main_back"))
+    notify_admin_payment(chat_id, f"User {chat_id}",
+                         ", ".join(i["name"] for i in cart),
+                         total, method, invoice=invoice_num)
+    return text, kb
+
+def main_menu_content(chat_id=None):
+    cart_total = get_cart_total(chat_id) if chat_id else 0.0
+    text = (
+        "<b>Last seen:</b> recently\n"
+        "<b>Ships from:</b> United Kingdom → United Kingdom\n"
+        "<b>Sales:</b> 29,423\n"
+        "<b>Currency:</b> GBP\n"
+        "<b>Rating:</b> ★4.89 (7,919)\n"
+        "👋 Openline - <b>Quality meets consistency</b>.\n\n"
+        "🏆 Est. 2020 with 70k+ total sales across DNMs, TG + Directs.\n\n"
+        "❄️ <b>Stimulant specialists</b>. We stock many different HQ products.\n\n"
+        "🔴 2 PM Cutoff for next day delivery.\n\n"
+        "🤖 @openline_trackbot\n"
+        "💬 https://t.me/+tfQVU4xwsDVmNTFi"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🚀 Listings", callback_data="listings"))
+    kb.add(types.InlineKeyboardButton("⬇️ HUGE Cocaine Price Drop! ⬇️", callback_data="price_drop"))
+    kb.add(types.InlineKeyboardButton("🌐 ☕ My cafe! ☕ 🌐", callback_data="my_cafe"))
+    kb.add(types.InlineKeyboardButton("‼️ MIDWEEK MADNESS ‼️ 24 HRS.. ⏰", callback_data="midweek_madness"))
+    kb.row(
+        types.InlineKeyboardButton("❓ FAQ", callback_data="faq"),
+        types.InlineKeyboardButton("Terms of Service", callback_data="tos")
+    )
+    kb.row(
+        types.InlineKeyboardButton("📈 Rating ★4.89", callback_data="ratings_1"),
+        types.InlineKeyboardButton("🔑 PGP", callback_data="pgp")
+    )
+    kb.row(
+        types.InlineKeyboardButton("📦 Orders", callback_data="orders"),
+        types.InlineKeyboardButton("👤 Profile", callback_data="profile"),
+        types.InlineKeyboardButton(f"🛒 £{cart_total:.2f}", callback_data="cart")
+    )
+    kb.add(types.InlineKeyboardButton("📬 Contact", callback_data="contact"))
+    return text, kb
+
+
+# ── Unified screen management ──────────────────────────────────────────────────
+# One active message per user. Every new screen deletes the old one first.
+
+user_active_msg = {}   # chat_id → message_id of the current bot message
+
+def _delete_active(chat_id):
+    mid = user_active_msg.pop(chat_id, None)
+    if mid:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+def _track(chat_id, msg):
+    if msg:
+        user_active_msg[chat_id] = msg.message_id
+
+def show_photo_screen(chat_id, text, kb, photo_id=None, photo_path=None, cache_key=None):
+    """Delete previous message, send photo (or text fallback), track new message."""
+    _delete_active(chat_id)
+    # Send from local file, cache the returned file_id for future calls
+    if photo_path and _os.path.exists(photo_path):
+        try:
+            with open(photo_path, "rb") as f:
+                msg = bot.send_photo(chat_id, f, caption=text, parse_mode="HTML", reply_markup=kb)
+            _track(chat_id, msg)
+            if cache_key:
+                _PRODUCT_IMAGE_CACHE[cache_key] = msg.photo[-1].file_id
+            return
+        except Exception as e:
+            logging.error(f"send_photo (file) failed: {e}")
+    # Use cached file_id or fallback menu image
+    img = photo_id or MAIN_MENU_IMAGE_ID
+    if img:
+        try:
+            _track(chat_id, bot.send_photo(chat_id, photo=img,
+                                           caption=text, parse_mode="HTML", reply_markup=kb))
+            return
+        except Exception as e:
+            logging.error(f"send_photo failed: {e}")
+    _track(chat_id, bot.send_message(chat_id, text, parse_mode="HTML",
+                                     reply_markup=kb, disable_web_page_preview=True))
+
+def show_text_screen(chat_id, text, kb):
+    """Delete previous message, send text message, track new message."""
+    _delete_active(chat_id)
+    _track(chat_id, bot.send_message(chat_id, text, parse_mode="HTML",
+                                     reply_markup=kb, disable_web_page_preview=True))
+
+def update_text_screen(chat_id, text, kb):
+    """Edit current tracked message in place (used for qty +/- on product page).
+    Tries caption edit first (photo messages), then text edit, then sends new."""
+    mid = user_active_msg.get(chat_id)
+    if mid:
+        try:
+            bot.edit_message_caption(chat_id=chat_id, message_id=mid, caption=text,
+                                     parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            pass
+        try:
+            bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text,
+                                  parse_mode="HTML", reply_markup=kb,
+                                  disable_web_page_preview=True)
+            return
+        except Exception:
+            pass
+    show_text_screen(chat_id, text, kb)
+
+def show_main_menu(chat_id):
+    text, kb = main_menu_content(chat_id)
+    show_photo_screen(chat_id, text, kb)
+
+# Keep these aliases so existing call-sites still work
+def _send_photo_or_text(chat_id, text, kb):
+    show_photo_screen(chat_id, text, kb)
+
+def _edit_caption_or_new(chat_id, _mid, text, kb):
+    show_photo_screen(chat_id, text, kb)
+
+def _edit_text_or_new(chat_id, _mid, text, kb):
+    update_text_screen(chat_id, text, kb)
+
+# ── /start handler ─────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    chat_id = message.chat.id
+    first_name = message.from_user.first_name or "there"
+    username = message.from_user.username or ""
+    last_name = message.from_user.last_name or ""
+
+    db_register_user(chat_id, username, first_name, last_name)
+    _delete_active(chat_id)
+
+    phrase = db_get_user_emoji(chat_id)
+    if phrase:
+        text, kb = passphrase_confirmation_content(phrase)
+        show_photo_screen(chat_id, text, kb)
+    else:
+        text, kb = passphrase_intro_content()
+        _track(chat_id, bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb))
+
+# ── Callback dispatcher ────────────────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda _: True)
+def handle_callback(call):
+    chat_id = call.message.chat.id
+    mid = call.message.message_id
+    data = call.data
+
+    bot.answer_callback_query(call.id)
+
+    # ── Passphrase flow ──────────────────────────────────────────────────────
+
+    if data == "about_secret_phrase":
+        text, kb = passphrase_about_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "passphrase_about_understood":
+        text, kb = passphrase_intro_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "set_secret_phrase":
+        text, kb = passphrase_entry_content()
+        show_text_screen(chat_id, text, kb)
+        waiting_for_phrase.add(chat_id)
+        first_time_setup.add(chat_id)
+
+    elif data == "phrase_verified":
+        if chat_id in first_time_setup:
+            first_time_setup.discard(chat_id)
+            text, kb = safety_warning_content()
+            _send_photo_or_text(chat_id, text, kb)
+        else:
+            show_main_menu(chat_id)
+
+    elif data == "phrase_denied":
+        text, kb = passphrase_entry_content()
+        show_text_screen(chat_id, text, kb)
+        waiting_for_phrase.add(chat_id)
+
+    elif data == "safety_agreed":
+        show_main_menu(chat_id)
+
+    elif data == "group_chats_understood":
+        show_main_menu(chat_id)
+
+    # ── Main menu ────────────────────────────────────────────────────────────
+
+    elif data == "listings":
+        text, kb = listings_content(chat_id)
+        _send_photo_or_text(chat_id, text, kb)
+
+    elif data.startswith("cat_"):
+        cat_name = data[4:]
+        text, kb = category_content(cat_name, chat_id)
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data.startswith("subcat_"):
+        parts = data[7:].split("|", 1)
+        cat_name, subcat_name = parts[0], parts[1]
+        text, kb = subcategory_content(cat_name, subcat_name, chat_id)
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data.startswith("prodi_"):
+        parts = data[6:].split("|", 2)
+        if len(parts) == 3:
+            cat_n, sub_n, idx_s = parts
+            try:
+                product_name = PRODUCTS[cat_n][sub_n][int(idx_s)][0]
+                _step = PRODUCT_DETAILS.get(product_name, {}).get("step", 1.0)
+                user_product_state[chat_id] = {"product": product_name, "qty": _step}
+                text, kb = product_content(product_name, chat_id)
+                _fid, _path = get_product_image(product_name)
+                show_photo_screen(chat_id, text, kb,
+                                  photo_id=_fid, photo_path=_path, cache_key=product_name)
+            except (KeyError, IndexError, ValueError):
+                pass
+
+    elif data.startswith("prod_"):
+        parts = data[5:].split("|", 2)
+        if len(parts) == 3:
+            _, __, product_name = parts
+            _step = PRODUCT_DETAILS.get(product_name, {}).get("step", 1.0)
+            user_product_state[chat_id] = {"product": product_name, "qty": _step}
+            text, kb = product_content(product_name, chat_id)
+            _fid, _path = get_product_image(product_name)
+            show_photo_screen(chat_id, text, kb,
+                              photo_id=_fid, photo_path=_path, cache_key=product_name)
+
+    elif data in ("qty_plus", "qty_minus", "qty_manual", "add_to_cart", "add_wishlist",
+                  "prod_reviews", "cart_view"):
+        state = user_product_state.get(chat_id, {})
+        product_name = state.get("product")
+
+        if data == "qty_plus" and product_name:
+            step = PRODUCT_DETAILS.get(product_name, {}).get("step", 1.0)
+            state["qty"] = state.get("qty", step) + step
+            user_product_state[chat_id] = state
+            text, kb = product_content(product_name, chat_id)
+            update_text_screen(chat_id, text, kb)
+
+        elif data == "qty_minus" and product_name:
+            step = PRODUCT_DETAILS.get(product_name, {}).get("step", 1.0)
+            state["qty"] = max(step, state.get("qty", step) - step)
+            user_product_state[chat_id] = state
+            text, kb = product_content(product_name, chat_id)
+            update_text_screen(chat_id, text, kb)
+
+        elif data == "qty_manual":
+            waiting_for_qty.add(chat_id)
+            bot.send_message(chat_id, "✏️ Enter the quantity (e.g. 5 or 10):")
+
+        elif data == "add_to_cart" and product_name:
+            qty = state.get("qty", 1.0)
+            d = PRODUCT_DETAILS.get(product_name, {})
+            unit = d.get("unit", "pcs")
+            price_each = get_tier_price(product_name, qty)
+            line_total = round(qty * price_each, 2)
+            cart = user_cart.setdefault(chat_id, [])
+            cart.append({"name": product_name, "qty": qty, "unit": unit,
+                         "price_each": price_each, "line_total": line_total})
+            bot.answer_callback_query(call.id, f"✅ Added {qty:.2f} {unit} × {product_name} to cart!")
+            text, kb = product_content(product_name, chat_id)
+            update_text_screen(chat_id, text, kb)
+
+        elif data == "add_wishlist" and product_name:
+            db_add_wishlist_item(chat_id, product_name)
+            bot.answer_callback_query(call.id, "❤️ Added to wishlist!")
+
+        elif data == "prod_reviews" and product_name:
+            text, kb = ratings_content(page_number=1, filter_product=product_name,
+                                       back_callback=f"subcat_{PRODUCT_DETAILS.get(product_name,{}).get('cat','')}|{PRODUCT_DETAILS.get(product_name,{}).get('subcat','')}")
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+        elif data == "cart_view":
+            text, kb = cart_content(chat_id)
+            show_text_screen(chat_id, text, kb)
+
+    elif data == "pgp":
+        text, kb = pgp_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data in ("tos", "terms"):
+        text, kb = tos_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "midweek_madness":
+        text, kb = midweek_content(1)
+        show_text_screen(chat_id, text, kb)
+
+    elif data.startswith("midweek_"):
+        try:
+            page = int(data.split("_")[1])
+            text, kb = midweek_content(page)
+            update_text_screen(chat_id, text, kb)
+        except (IndexError, ValueError):
+            pass
+
+    elif data == "price_list":
+        text, kb = price_list_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "price_drop":
+        text, kb = price_drop_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "my_cafe":
+        text, kb = my_cafe_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "faq":
+        text, kb = faq_content()
+        show_photo_screen(chat_id, text, kb)
+
+    elif data.startswith("faq_"):
+        answer = FAQ_ANSWERS.get(data, "ℹ️ Answer coming soon.")
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("← Back to FAQ", callback_data="faq"))
+        show_text_screen(chat_id, answer, kb2)
+
+    elif data == "main_back":
+        text, kb = main_menu_content(chat_id)
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data == "ratings_1":
+        text, kb = ratings_content(page_number=1, back_callback="main_back")
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data == "contact":
+        text, kb = chat_closed_content()
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data == "chat_history":
+        text, kb = chat_history_content(chat_id)
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data == "reopen_chat":
+        user_chat_closed.discard(chat_id)
+        bot.send_message(chat_id, "💬 Chat reopened. Send your message now.")
+
+    elif data == "orders":
+        orders = db_get_pending_orders(chat_id)
+        if not orders:
+            text = "📦 <b>Your Orders</b>\n\nYou have no pending orders."
+        else:
+            text = "📦 <b>Your Pending Orders</b>\n\n"
+            for inv, _, product, amount, *_ in orders:
+                text += f"• Invoice #{inv} — {product} — £{amount:.2f}\n"
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("← Back", callback_data="main_back"))
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data == "profile":
+        user = db_get_user(chat_id)
+        phrase = db_get_user_emoji(chat_id)
+        if user:
+            _, username, first_name, last_name, reg_at = user
+            reg_str = datetime.fromtimestamp(reg_at).strftime("%d %b %Y") if reg_at else "Unknown"
+            text = (f"👤 <b>Profile</b>\n\n"
+                    f"<b>Name:</b> {first_name} {last_name}\n"
+                    f"<b>Username:</b> @{username}\n"
+                    f"<b>Chat ID:</b> <code>{chat_id}</code>\n"
+                    f"<b>Registered:</b> {reg_str}\n"
+                    f"<b>Secret phrase:</b> <code>{phrase or 'Not set'}</code>")
+        else:
+            text = "👤 <b>Profile</b>\n\nNo profile found."
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("← Back", callback_data="main_back"))
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+    elif data in ("cart", "cart_main"):
+        text, kb = cart_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "checkout":
+        text, kb = checkout_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "checkout_payment":
+        text, kb = payment_method_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data.startswith("pay_method_"):
+        method = data[len("pay_method_"):]
+        user_payment_method[chat_id] = method
+        text, kb = checkout_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "checkout_discount":
+        waiting_for_discount.add(chat_id)
+        kb2 = types.InlineKeyboardMarkup()
+        for code in PRESET_DISCOUNT_CODES:
+            kb2.add(types.InlineKeyboardButton(code, callback_data=f"apply_discount_{code}"))
+        kb2.add(types.InlineKeyboardButton("Cancel", callback_data="checkout"))
+        show_text_screen(chat_id,
+            "Send a discount code to the chat. If you don't have a promo code, "
+            "you can choose one of the following offers:", kb2)
+
+    elif data.startswith("apply_discount_"):
+        waiting_for_discount.discard(chat_id)
+        code = data[len("apply_discount_"):]
+        pct = PRESET_DISCOUNT_CODES.get(code, 0.0)
+        if pct:
+            user_discount[chat_id] = pct
+            user_discount_code[chat_id] = code
+        text, kb = checkout_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "checkout_delivery":
+        text, kb = delivery_method_content()
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "delivery_1st":
+        user_delivery[chat_id] = "Tracked24 NoSign - £6.30"
+        text, kb = checkout_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "delivery_sd":
+        user_delivery[chat_id] = "Special Delivery 1PM Signed For - £11.00"
+        text, kb = checkout_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "checkout_address":
+        waiting_for_address.add(chat_id)
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("Why is it safe?",  callback_data="address_why_safe"))
+        kb2.add(types.InlineKeyboardButton("Vendor PGP Key",   callback_data="pgp"))
+        kb2.add(types.InlineKeyboardButton("Cancel",           callback_data="checkout"))
+        show_text_screen(chat_id,
+            "You can send a message to the chat either as an encrypted message or as plain text. "
+            "The bot will handle the encryption of your message and display it to the seller after "
+            "the order is paid for.\n\n"
+            "Please type your address in this format:\n\n"
+            "<code>(YOUR NAME) – JAMES HILLS\n"
+            "(STREET NAME + NUMBER) – Victoria St 155\n"
+            "(CITY) – LONDON\n"
+            "(POSTAL CODE) – SW1E 5N\n"
+            "(COUNTRY) – UNITED KINGDOM</code>", kb2)
+
+    elif data == "checkout_tos":
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("Terms of Service", callback_data="tos"))
+        kb2.add(types.InlineKeyboardButton("Agree",            callback_data="checkout_confirm"))
+        kb2.add(types.InlineKeyboardButton("Disagree",         callback_data="checkout"))
+        show_text_screen(chat_id,
+            "Please review the Terms of Service before completing this order.\n\n"
+            "By choosing \"Agree\", you confirm that you have read and accept the "
+            "current Terms of Service.", kb2)
+
+    elif data == "checkout_confirm":
+        text, kb = checkout_confirm_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "i_understand":
+        text, kb = payment_pending_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "check_address":
+        addr = user_address.get(chat_id, "No address saved.")
+        invoice_num = f"{(chat_id * 7 % 9000000) + 1000000}"
+        import tempfile, os as _os
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt",
+            prefix=f"Address{invoice_num}-", delete=False)
+        tmp.write(addr)
+        tmp.close()
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("Vendor PGP Key",   callback_data="pgp"))
+        kb2.add(types.InlineKeyboardButton("Delete Message",   callback_data=f"delete_doc_{tmp.name}"))
+        caption = (f"This is your address encrypted for your order <b>{invoice_num}</b>. "
+                   "Only the vendor with PGP access can access it securely.")
+        with open(tmp.name, "rb") as f:
+            bot.send_document(chat_id, f,
+                              visible_file_name=f"Address{invoice_num}-ae4cba.txt",
+                              caption=caption, parse_mode="HTML",
+                              reply_markup=kb2)
+
+    elif data == "remove_address":
+        user_address.pop(chat_id, None)
+        text, kb = checkout_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data.startswith("delete_doc_"):
+        import os as _os
+        try:
+            _os.unlink(data[len("delete_doc_"):])
+        except Exception:
+            pass
+        try:
+            bot.delete_message(chat_id, call.message.message_id)
+        except Exception:
+            pass
+
+    elif data == "address_why_safe":
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("← Back", callback_data="checkout_address"))
+        show_text_screen(chat_id,
+            "🔒 <b>Why is it safe?</b>\n\n"
+            "Your address is encrypted using the vendor's PGP public key before being stored. "
+            "This means only the vendor can decrypt and read your address — not the bot, "
+            "not the server, and not any third party.\n\n"
+            "Even if the bot were compromised, your address remains unreadable without the "
+            "vendor's private key.", kb2)
+
+    elif data == "qr_code":
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("Back", callback_data="i_understand"))
+        show_text_screen(chat_id,
+            "📷 <b>QR Code</b>\n\nQR code generation is not available at this time.\n"
+            "Please copy the wallet address manually.", kb2)
+
+    elif data == "add_notes":
+        waiting_for_address.add(chat_id)
+        kb2 = types.InlineKeyboardMarkup()
+        kb2.add(types.InlineKeyboardButton("Cancel", callback_data="i_understand"))
+        show_text_screen(chat_id,
+            "📝 <b>Add Notes</b>\n\nType any notes for your order (special instructions, "
+            "alternative contact, etc.):", kb2)
+
+    elif data == "refresh_pending":
+        text, kb = payment_pending_content(chat_id)
+        show_text_screen(chat_id, text, kb)
+
+    elif data == "clear_cart":
+        user_cart.pop(chat_id, None)
+        user_payment_method.pop(chat_id, None)
+        user_address.pop(chat_id, None)
+        user_delivery.pop(chat_id, None)
+        user_discount.pop(chat_id, None)
+        user_discount_code.pop(chat_id, None)
+        show_main_menu(chat_id)
+
+    elif data.startswith("remove_cart_"):
+        try:
+            idx = int(data[len("remove_cart_"):])
+            cart = user_cart.get(chat_id, [])
+            if 0 <= idx < len(cart):
+                cart.pop(idx)
+            text, kb = cart_content(chat_id)
+            show_text_screen(chat_id, text, kb)
+        except (ValueError, IndexError):
+            pass
+
+    # ── Reviews pagination ───────────────────────────────────────────────────
+
+    elif data.startswith("rstar_") or data.startswith("rpage_"):
+        parts = data.split("_pf_")
+        base = parts[0]
+        pf = parts[1] if len(parts) > 1 else None
+        segs = base.split("_")
+        if segs[0] == "rstar":
+            fs = None if segs[1] == "all" else int(segs[1])
+            pg = int(segs[2]) if len(segs) > 2 else 1
+        else:
+            pg = int(segs[1])
+            sf = segs[2]
+            fs = None if sf == "all" else int(sf)
+        text, kb = ratings_content(page_number=pg, filter_stars=fs, filter_product=pf, back_callback="main_back")
+        _edit_caption_or_new(chat_id, mid, text, kb)
+
+# ── Secret phrase text input ───────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_qty and m.content_type == "text")
+def handle_qty_input(message):
+    chat_id = message.chat.id
+    waiting_for_qty.discard(chat_id)
+    try:
+        qty = float(message.text.strip().replace(",", "."))
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Invalid quantity. Please enter a positive number.")
+        return
+    state = user_product_state.get(chat_id, {})
+    product_name = state.get("product")
+    if not product_name:
+        return
+    state["qty"] = qty
+    user_product_state[chat_id] = state
+    text, kb = product_content(product_name, chat_id)
+    update_text_screen(chat_id, text, kb)
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_discount and m.content_type == "text")
+def handle_discount_input(message):
+    chat_id = message.chat.id
+    waiting_for_discount.discard(chat_id)
+    code = message.text.strip()
+    matched = code if code in PRESET_DISCOUNT_CODES else (code.upper() if code.upper() in PRESET_DISCOUNT_CODES else None)
+    if matched:
+        pct = PRESET_DISCOUNT_CODES[matched]
+        user_discount[chat_id] = pct
+        user_discount_code[chat_id] = matched
+        bot.send_message(chat_id, f"✅ Discount code applied: {pct:.1f}% off")
+    else:
+        bot.send_message(chat_id, "❌ Invalid discount code.")
+    text, kb = checkout_content(chat_id)
+    show_text_screen(chat_id, text, kb)
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_address and m.content_type == "text")
+def handle_address_input(message):
+    chat_id = message.chat.id
+    waiting_for_address.discard(chat_id)
+    address = message.text.strip()
+    if len(address) < 5:
+        bot.send_message(chat_id, "⚠️ Address too short. Please try again.")
+        waiting_for_address.add(chat_id)
+        return
+    user_address[chat_id] = address
+    kb2 = types.InlineKeyboardMarkup()
+    kb2.row(
+        types.InlineKeyboardButton("Check Delivery Address",  callback_data="check_address"),
+        types.InlineKeyboardButton("Remove Delivery Address", callback_data="remove_address"),
+    )
+    kb2.add(types.InlineKeyboardButton("Continue checkout", callback_data="checkout"))
+    show_text_screen(chat_id,
+        "🎉 Your address has been encrypted using the seller's public key and saved. "
+        "The address will be revealed to the seller after the order is paid for.", kb2)
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_phrase and m.content_type == "text")
+def handle_phrase_input(message):
+    chat_id = message.chat.id
+    phrase = message.text.strip()
+    if len(phrase) < 4 or len(phrase) > 100:
+        bot.send_message(chat_id, "⚠️ Phrase must be 4–100 characters. Please try again.")
+        return
+    waiting_for_phrase.discard(chat_id)
+    store_secret_phrase(chat_id, phrase)
+    text, kb = passphrase_confirmation_content(phrase)
+    _send_photo_or_text(chat_id, text, kb)
+
+# ── Admin: set menu image ─────────────────────────────────────────────────────
+
+@bot.message_handler(content_types=["photo"],
+                     func=lambda m: m.chat.id in ADMIN_IDS)
+def handle_admin_photo(message):
+    file_id = message.photo[-1].file_id
+    # Save to config.py so it persists across restarts
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if "MENU_IMAGE_ID" in content:
+            import re
+            content = re.sub(r'MENU_IMAGE_ID\s*=\s*"[^"]*"', f'MENU_IMAGE_ID = "{file_id}"', content)
+        else:
+            content += f'\nMENU_IMAGE_ID = "{file_id}"\n'
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        global MAIN_MENU_IMAGE_ID
+        MAIN_MENU_IMAGE_ID = file_id
+        bot.reply_to(message, f"✅ Menu image updated!\n<code>{file_id}</code>", parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Failed to save: {e}")
+
+# ── Start polling ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    seed_reviews_db()
+    logging.info("🤖 Bot is running...")
+    bot.infinity_polling(timeout=30, long_polling_timeout=20)
